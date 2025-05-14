@@ -1,0 +1,31 @@
+name: Python CI
+
+on:
+  push:
+    branches: [ main, master ] # O la rama principal que uses
+  pull_request:
+    branches: [ main, master ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest # O un sistema operativo diferente si lo prefieres
+
+    steps:
+    - uses: actions/checkout@v3 # Baja tu código del repositorio
+
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.x' # Usa la versión de Python que estás usando
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+
+    - name: Run tests
+      run: |
+        # Si tienes pruebas, ejecútalas aquí.
+        # Si usas pytest:
+        # pytest
+        echo "Pruebas simuladas pasadas (reemplazar con pytest si tienes tests reales)"

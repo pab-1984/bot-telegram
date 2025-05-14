@@ -1,0 +1,58 @@
+# Bytecode compilado
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Entornos virtuales
+venv/
+.env/
+.venv/
+env/
+
+# Archivos de configuración de entorno
+*.env
+.env.*
+.env
+
+# Archivos de log y bases de datos temporales
+*.log
+*.sqlite3
+*.db
+
+# Archivos de pytest
+.cache/
+.pytest_cache/
+
+# Archivos de IPython/Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# Salidas de notebooks o scripts
+outputs/
+reports/
+
+# Archivos de test y cobertura
+.coverage
+htmlcov/
+coverage.xml
+
+# Archivos creados por editores
+.vscode/
+.idea/
+*.swp
+
+# Archivos del sistema
+.DS_Store
+Thumbs.db
+
+# Dependencias descargadas
+__pypackages__/
+dist/
+build/
+*.egg-info/
+
+# Archivos de lock si usás Poetry o Pipenv
+poetry.lock
+Pipfile.lock
+
+ngrok

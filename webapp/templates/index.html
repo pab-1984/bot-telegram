@@ -1,0 +1,386 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>TON Ten Challenge Web App</title>
+    <script src="https://telegram.org/js/telegram-web-app.js"></script>
+    <style>
+        /* Estilos CSS sencillos para la interfaz */
+        body {
+            font-family: sans-serif;
+            margin: 0;
+            padding: 10px;
+            background-color: var(--tg-theme-bg-color); /* Usar color de fondo de Telegram */
+            color: var(--tg-theme-text-color); /* Usar color de texto de Telegram */
+        }
+        h1, h2 {
+            color: var(--tg-theme-link-color); /* Usar color de enlace de Telegram */
+        }
+        .section {
+            background-color: var(--tg-theme-secondary-bg-color); /* Color de fondo secundario */
+            border-radius: 8px;
+            padding: 15px;
+            margin-bottom: 15px;
+        }
+        .round-item, .winner-item {
+            border-bottom: 1px solid var(--tg-theme-border-color); /* Color de borde */
+            padding: 10px 0;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        .round-item:last-child, .winner-item:last-child {
+            border-bottom: none;
+        }
+        button {
+            background-color: var(--tg-theme-button-color); /* Color de botón de Telegram */
+            color: var(--tg-theme-button-text-color); /* Color de texto de botón */
+            border: none;
+            border-radius: 5px;
+            padding: 8px 12px;
+            cursor: pointer;
+        }
+         button:active {
+            background-color: var(--tg-theme-button-color); /* Mantener color activo */
+         }
+         .round-info {
+            flex-grow: 1; /* Permite que la info ocupe el espacio disponible */
+            margin-right: 10px; /* Espacio entre info y botón */
+         }
+         .round-info div {
+            margin-bottom: 4px; /* Espacio entre líneas de info */
+         }
+         .small-text {
+            font-size: 0.9em;
+            opacity: 0.8; /* Menos prominente */
+         }
+         #message {
+            margin-top: 20px;
+            padding: 10px;
+            border-radius: 5px;
+            /* Usar colores de tema Telegram para mensajes de info */
+            background-color: var(--tg-theme-secondary-bg-color);
+            color: var(--tg-theme-text-color);
+            display: none; /* Oculto por defecto */
+         }
+         #message.error {
+             background-color: rgba(255, 0, 0, 0.2); /* Fondo rojo suave para errores */
+             color: red; /* Texto rojo para errores */
+         }
+         #message.success {
+             background-color: rgba(0, 128, 0, 0.2); /* Fondo verde suave para mensajes de éxito */
+             color: green; /* Texto verde para éxito */
+         }
+
+
+    </style>
+</head>
+<body>
+    <h1>TON Ten Challenge</h1>
+
+    <div id="message"></div>
+
+    <div class="section">
+        <h2>🏆 Ganadores Recientes</h2>
+        <div id="winners-list">
+            <p>Cargando ganadores...</p>
+        </div>
+    </div>
+
+    <div class="section">
+        <h2>🎮 Rondas Abiertas</h2>
+        <div id="open-rounds-list">
+            <p>Cargando rondas...</p>
+        </div>
+    </div>
+
+    <div class="section">
+        <h2>➕ Crear Nueva Ronda</h2>
+        <button id="create-round-button">Crear Ronda Personal</button>
+    </div>
+
+
+    <script>
+        // Acceder a la información de Telegram Web App
+        const tg = window.Telegram.WebApp;
+
+        // Mostrar el botón principal de Telegram si está disponible
+        // tg.ready() se llama automáticamente cuando el script carga, pero puedes llamarlo explícitamente si necesitas asegurarte
+        tg.ready();
+        tg.MainButton.setText("Cerrar Web App");
+        tg.MainButton.onClick(function() { tg.close(); });
+        tg.MainButton.show(); // Mostrar el botón de cerrar
+
+
+        function showMessage(text, type = 'info') { // 'info', 'success', 'error'
+            const messageDiv = document.getElementById('message');
+            messageDiv.innerHTML = text; // Usar innerHTML para permitir formato como <code> o <a href>
+            messageDiv.className = type; // Asignar clase según el tipo de mensaje
+            messageDiv.style.display = 'block';
+             // Ocultar el mensaje después de unos segundos (excepto quizás para errores críticos)
+             if (type !== 'error' || text.length < 100) { // Ocultar mensajes no-error o errores cortos
+                setTimeout(() => {
+                   messageDiv.style.display = 'none';
+                }, 7000); // Ocultar después de 7 segundos
+             }
+        }
+
+
+        // --- Funciones para interactuar con el Backend Flask ---
+
+        async function fetchWinners() {
+             try {
+                const response = await fetch('/api/winners');
+                if (!response.ok) {
+                    // Si la respuesta no es 200 OK, lanzar un error
+                    const errorText = await response.text();
+                    throw new Error(`HTTP error! status: ${response.status}, body: ${errorText}`);
+                }
+                const winners = await response.json();
+                const winnersListDiv = document.getElementById('winners-list');
+                winnersListDiv.innerHTML = ''; // Limpiar contenido
+
+                if (winners.length === 0) {
+                    winnersListDiv.innerHTML = '<p>Aún no hay ganadores registrados.</p>';
+                    return;
+                }
+
+                winners.forEach(winner => {
+                    const winnerItem = document.createElement('div');
+                    winnerItem.className = 'winner-item';
+                    // Usamos innerHTML para el formato, asumiendo que winner.winner y winner.prize son seguros
+                    winnerItem.innerHTML = `
+                        <div class="winner-info">
+                             <div>Ronda ID: <code>${winner.round_id}</code></div>
+                             <div>Ganador: ${winner.winner}</div>
+                             <div>Premio: ${winner.prize}</div>
+                        </div>
+                    `;
+                    winnersListDiv.appendChild(winnerItem);
+                });
+             } catch (error) {
+                 console.error('Error fetching winners:', error);
+                 document.getElementById('winners-list').innerHTML = '<p style="color:red;">Error al cargar ganadores.</p>';
+                 showMessage('Error al cargar ganadores. Intenta recargar la página.', 'error');
+             }
+        }
+
+        async function fetchOpenRounds() {
+            try {
+                const response = await fetch('/api/open_rounds');
+                 if (!response.ok) {
+                    const errorText = await response.text();
+                    throw new Error(`HTTP error! status: ${response.status}, body: ${errorText}`);
+                }
+                const rounds = await response.json();
+                const openRoundsListDiv = document.getElementById('open-rounds-list');
+                openRoundsListDiv.innerHTML = ''; // Limpiar contenido
+
+                if (rounds.length === 0) {
+                    openRoundsListDiv.innerHTML = '<p>No hay rondas abiertas actualmente.</p>';
+                     // Asegurarse de que el botón de crear ronda esté visible
+                     document.getElementById('create-round-button').style.display = 'block';
+                    return;
+                }
+
+                rounds.forEach(round => {
+                    const roundItem = document.createElement('div');
+                    roundItem.className = 'round-item';
+                    // Usamos innerHTML para el formato
+                    roundItem.innerHTML = `
+                        <div class="round-info">
+                            <div>ID: <code>${round.id}</code></div>
+                            <div class="small-text">Tipo: ${round.type} | Estado: ${round.status}</div>
+                            <div>Participantes: ${round.participants}</div>
+                            <div class="small-text">Contrato Sim.: <code>${round.simulated_contract_address}</code></div>
+                             ${round.share_url ? `<div class="small-text"><a href="${round.share_url}">Compartir Ronda</a></div>` : ''} </div>
+                        <button class="join-button" data-round-id="${round.id}">Unirse</button>
+                    `;
+                    openRoundsListDiv.appendChild(roundItem);
+
+                    // Añadir event listener al botón Unirse (debe hacerse DESPUÉS de añadirlo al DOM)
+                     const joinButton = roundItem.querySelector('.join-button');
+                     if (joinButton) { // Verificar que el botón existe
+                         joinButton.addEventListener('click', handleJoinButtonClick);
+                     }
+                });
+
+                 // Asegurarse de que el botón de crear ronda también esté visible
+                 document.getElementById('create-round-button').style.display = 'block';
+
+            } catch (error) {
+                 console.error('Error fetching open rounds:', error);
+                 document.getElementById('open-rounds-list').innerHTML = '<p style="color:red;">Error al cargar rondas abiertas.</p>';
+                 showMessage('Error al cargar rondas abiertas. Intenta recargar la página.', 'error');
+            }
+        }
+
+        async function handleJoinButtonClick(event) {
+             const button = event.target;
+             const roundId = button.dataset.roundId;
+             button.disabled = true; // Deshabilitar botón para evitar clics múltiples
+
+             showMessage(`Intentando unirse a ronda ${roundId}...`);
+
+             try {
+                // --- Verificación segura de datos del usuario ---
+                // Accedemos a tg.initDataUnsafe que contiene información del usuario y la firma (hash)
+                const unsafeData = tg.initDataUnsafe;
+                // Verificamos si unsafeData y unsafeData.user existen antes de intentar acceder a sus propiedades
+                if (!unsafeData || !unsafeData.user) {
+                    // Si no hay datos de usuario, mostramos un error y salimos
+                    showMessage("Error: No se pudo obtener la información del usuario de Telegram. Asegúrate de abrir la Interfaz Gráfica desde el botón en el chat.", 'error');
+                    console.error("Telegram.WebApp.initDataUnsafe o user object is missing.");
+                    button.disabled = false; // Habilitar botón de nuevo antes de salir
+                    // Opcional: Deshabilitar todos los botones que requieran user_id si esto falla
+                    return; // Salir de la función si no hay datos de usuario
+                }
+                const user = unsafeData.user; // Ahora sabemos que 'user' existe
+                const userId = user.id; // Acceso seguro a user.id
+                const username = user.username || `user_${userId}`; // Usar username si existe, si no, un placeholder
+
+                // --- Enviar datos al Backend ---
+                // Envía user_id y username al backend para que pueda registrar al usuario si es necesario y añadirlo a la ronda.
+                // En una implementación segura, también enviarías tg.initData (la cadena completa)
+                // y VALIDARÍAS su hash en el backend para confirmar que los datos son auténticos de Telegram.
+                const response = await fetch(`/api/join_round/${roundId}`, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({
+                         telegram_id: userId.toString(), // Asegúrate de que es string si tu DB espera string
+                         username: username
+                         // Opcional pero recomendado para seguridad: enviar tg.initData como string
+                         // init_data: tg.initData
+                    })
+                });
+
+                // Verificar si la respuesta HTTP fue exitosa (status 200-299)
+                 if (!response.ok) {
+                    const errorText = await response.text(); // Leer el cuerpo de la respuesta de error
+                    throw new Error(`HTTP error! status: ${response.status}, body: ${errorText}`);
+                }
+
+                const result = await response.json(); // Parsear la respuesta JSON
+
+                // Procesar el resultado JSON retornado por tu API de Flask
+                if (result.success) {
+                    showMessage(result.message, 'success'); // Muestra el mensaje de éxito de tu lógica
+                    // Opcional: Recargar la lista de rondas abiertas después de unirse para ver el conteo actualizado
+                    fetchOpenRounds();
+                     // Notificar al bot en el chat principal que el usuario se unió (opcional)
+                     // tg.sendData(`joined_round_${roundId}`); // Envía un string al bot que puedes manejar con un MessageHandler(filters.TEXT)
+                } else {
+                    // Si success es false en la respuesta JSON de Flask
+                    showMessage(`Error al unirse: ${result.message}`, 'error'); // Muestra el mensaje de error de tu lógica
+                }
+
+             } catch (error) {
+                 // Manejar errores de red o errores HTTP no-OK
+                 console.error('Error joining round:', error);
+                 showMessage('Ocurrió un error al unirse a la ronda. Intenta de nuevo más tarde.', 'error');
+             } finally {
+                 // Este bloque se ejecuta siempre, al final del try...catch
+                 button.disabled = false; // Habilitar botón de nuevo
+             }
+        }
+
+        async function handleCreateRoundButtonClick() {
+             const button = document.getElementById('create-round-button');
+             button.disabled = true; // Deshabilitar botón
+             showMessage("Creando nueva ronda...");
+
+             try {
+                 // --- Verificación segura de datos del usuario ---
+                 const unsafeData = tg.initDataUnsafe;
+                 if (!unsafeData || !unsafeData.user) {
+                      showMessage("Error: No se pudo obtener la información del usuario de Telegram. Asegúrate de abrir la Interfaz Gráfica desde el botón en el chat.", 'error');
+                      console.error("Telegram.WebApp.initDataUnsafe o user object is missing.");
+                      button.disabled = false; // Habilitar botón de nuevo antes de salir
+                      return; // Salir de la función si no hay datos de usuario
+                  }
+                  const user = unsafeData.user; // Ahora sabemos que 'user' existe
+                  const userId = user.id; // Acceso seguro a user.id
+                  const username = user.username || `user_${userId}`; // Usar username si existe, si no, un placeholder
+                  // ------------------------------------------------
+
+
+                 const response = await fetch('/api/create_round', {
+                     method: 'POST',
+                     headers: {
+                         'Content-Type': 'application/json',
+                     },
+                     body: JSON.stringify({
+                          telegram_id: userId.toString(), // Enviar user_id y username al backend
+                          username: username
+                          // Opcional pero recomendado para seguridad: init_data: tg.initData
+                     })
+                 });
+
+                 // Verificar si la respuesta HTTP fue exitosa
+                 if (!response.ok) {
+                    const errorText = await response.text();
+                    throw new Error(`HTTP error! status: ${response.status}, body: ${errorText}`);
+                 }
+
+                 const result = await response.json(); // Parsear la respuesta JSON
+
+                 // Procesar el resultado JSON retornado por tu API de Flask
+                 if (result.success) {
+                     // Mostrar mensaje de éxito de tu lógica
+                     showMessage(result.message, 'success');
+                     // Si la respuesta incluye una URL para compartir...
+                     if (result.share_url) {
+                          // Mostrar un mensaje adicional con el enlace para compartir (usando innerHTML para el enlace)
+                          showMessage(`🔗 <a href="${result.share_url}">Comparte este enlace para invitar a tus amigos!</a>`, 'info');
+                     }
+
+
+                     // Recargar la lista de rondas abiertas para mostrar la nueva ronda creada
+                     fetchOpenRounds();
+                      // Notificar al bot en el chat principal que la ronda fue creada (opcional)
+                      // tg.sendData(`created_round_${result.round_id}`);
+                 } else {
+                     // Si success es false en la respuesta JSON de Flask
+                     showMessage(`Error al crear ronda: ${result.message}`, 'error'); // Muestra el mensaje de error de tu lógica
+                 }
+
+             } catch (error) {
+                 // Manejar errores de red o errores HTTP no-OK
+                 console.error('Error creating round:', error);
+                 showMessage('Ocurrió un error al crear la ronda. Intenta de nuevo más tarde.', 'error');
+             } finally {
+                 // Este bloque se ejecuta siempre
+                 button.disabled = false; // Habilitar botón
+             }
+        }
+
+        // Añadir event listener al botón Crear Ronda
+        document.getElementById('create-round-button').addEventListener('click', handleCreateRoundButtonClick);
+
+
+        // --- Cargar datos al cargar la página ---
+        document.addEventListener('DOMContentLoaded', function() {
+            // Esto se ejecuta cuando el HTML está completamente cargado
+
+             // Usar colores de Telegram si están disponibles para el body y elementos principales
+             if (tg.themeParams) {
+                 document.body.style.backgroundColor = tg.themeParams.bg_color;
+                 document.body.style.color = tg.themeParams.text_color;
+                  // Puedes aplicar más estilos a otros elementos usando themeParams si quieres
+                  // Por ejemplo, tg.themeParams.link_color, tg.themeParams.button_color, etc.
+             }
+
+            // Cargar las listas de ganadores y rondas abiertas al cargar la página
+            fetchWinners();
+            fetchOpenRounds();
+        });
+
+        // Puedes añadir listeners para tg.onEvent() si necesitas reaccionar a eventos de Telegram Web App
+        // Por ejemplo, si el bot envía datos a la Web App.
+
+    </script>
+</body>
+</html>

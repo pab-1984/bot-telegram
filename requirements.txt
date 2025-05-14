@@ -1,0 +1,8 @@
+python-telegram-bot
+python-dotenv
+# Si vas a añadir pytest para testing básico, descomenta la siguiente línea:
+pytest
+# Si vas a añadir SQLAlchemy para una mejor gestión de DB, descomenta la siguiente línea:
+SQLAlchemy
+
+pytoniq
