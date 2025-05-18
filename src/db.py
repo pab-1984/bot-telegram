@@ -2,669 +2,681 @@
 
 import sqlite3
 import logging
-# Importamos datetime y timezone para manejo de tiempo y zonas horarias
-from datetime import datetime, timedelta, timezone
-
+import hashlib
+import os
+from datetime import datetime, timezone # Aseguramos timezone para consistencia
 
 logger = logging.getLogger(__name__)
 
-DATABASE_NAME = 'bot_data.db'
+# DATABASE_NAME será idealmente cargado desde config.json en bot.py y pasado aquí,
+# o podemos definir un default y permitir que bot.py lo configure.
+# Por ahora, lo definimos aquí, pero bot.py se asegurará de usar este nombre.
+DATABASE_NAME = 'bot_lotto_data.db' # Asegúrate que coincida con tu config.json
 
-# Función para generar la dirección simulada (Se llama desde create_new_round)
-# Aunque hashlib no se usa en otras funciones de db.py, la lógica de generación de dirección es específica de este módulo.
-import hashlib # Necesario para generar la dirección simulada
+def get_db_connection(db_name: str = DATABASE_NAME):
+    """Establece y devuelve una conexión a la base de datos SQLite."""
+    # check_same_thread=False es importante para Aiogram si se usa SQLite en un entorno async
+    conn = sqlite3.connect(db_name, check_same_thread=False)
+    conn.row_factory = sqlite3.Row # Para acceder a las columnas por nombre
+    return conn
 
 def generate_simulated_smart_contract_address(round_id: int) -> str:
-    """Genera una dirección simulada para el Smart Contract basada en ID de ronda y un timestamp."""
-    # Usamos el ID de ronda y un timestamp para generar una dirección única por ronda en la simulación.
-    # En una implementación real, la dirección del contrato derivaría de su código y datos iniciales,
-    # y se obtendría al desplegar o interactuar con el contrato en la blockchain.
-    data_to_hash = f"contract_{round_id}-{datetime.now().timestamp()}"
+    """Genera una dirección simulada para el Smart Contract."""
+    data_to_hash = f"sim_contract_round_{round_id}-{datetime.now().timestamp()}"
     simulated_hash = hashlib.sha256(data_to_hash.encode()).hexdigest()
-    return f"EQ_{simulated_hash[:12]}" # Formato que se parece a una dirección de TON
+    return f"EQsim_{simulated_hash[:16]}" # Un poco más largo y distintivo
+
+def _add_column_if_not_exists(cursor: sqlite3.Cursor, table_name: str, column_name: str, column_type: str):
+    """Función de utilidad para añadir una columna si no existe."""
+    try:
+        cursor.execute(f"SELECT {column_name} FROM {table_name} LIMIT 1")
+    except sqlite3.OperationalError:
+        try:
+            cursor.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_type}")
+            logger.info(f"Columna '{column_name}' añadida a la tabla '{table_name}'.")
+        except sqlite3.OperationalError as e_alter: # Podría fallar si la tabla está bloqueada o por otra razón
+            logger.error(f"Error al intentar añadir columna '{column_name}' a '{table_name}': {e_alter}")
 
 
-def init_db():
-    """Inicializa la base de datos y crea las tablas si no existen, añadiendo columnas si faltan."""
+def init_db(db_name: str = DATABASE_NAME):
+    """Inicializa la base de datos: crea tablas y añade columnas si faltan."""
     conn = None
     try:
-        conn = sqlite3.connect(DATABASE_NAME)
+        conn = get_db_connection(db_name)
         cursor = conn.cursor()
 
-        # Tabla para usuarios (registraremos su telegram_id y username)
+        # Tabla 'users': Mantiene telegram_id, username, y ahora ton_wallet
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS users (
                 telegram_id TEXT PRIMARY KEY,
-                username TEXT UNIQUE
+                username TEXT,
+                first_name TEXT, 
+                ton_wallet VARCHAR(68) DEFAULT NULL
             )
         ''')
+        # Migraciones para 'users'
+        _add_column_if_not_exists(cursor, "users", "first_name", "TEXT")
+        _add_column_if_not_exists(cursor, "users", "ton_wallet", "VARCHAR(68) DEFAULT NULL")
 
-        # Tabla para rondas
-        # status: 'waiting_to_start', 'waiting_for_payments', 'drawing', 'finished', 'cancelled'
-        # round_type: 'scheduled', 'user_created'
-        # deleted: 0 (False) o 1 (True) - Marca para eliminación
-        # simulated_contract_address: Dirección simulada del Smart Contract
-        # start_time: Cuando se creó la ronda (guardado como texto ISO 8601)
-        # end_time: Cuando terminó (sorteada o cancelada, guardado como texto ISO 8601)
+
+        # Tabla 'rounds': Mantiene información sobre las rondas de lotería (simuladas)
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS rounds (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                start_time DATETIME DEFAULT CURRENT_TIMESTAMP,
-                end_time DATETIME,
-                status TEXT NOT NULL,
-                round_type TEXT NOT NULL DEFAULT 'scheduled',
+                start_time TEXT NOT NULL, -- Guardar como ISO8601 UTC
+                end_time TEXT,           -- Guardar como ISO8601 UTC
+                status TEXT NOT NULL,    -- e.g., waiting_to_start, waiting_for_payments, drawing, finished, cancelled
+                round_type TEXT NOT NULL DEFAULT 'scheduled', -- e.g., scheduled, user_created
                 creator_telegram_id TEXT,
                 deleted BOOLEAN DEFAULT 0,
                 simulated_contract_address TEXT,
+                ticket_price_simulated REAL DEFAULT 1.0, -- Precio del boleto para esta ronda simulada
                 FOREIGN KEY (creator_telegram_id) REFERENCES users(telegram_id)
             )
         ''')
-
-        # --- Añadir nuevas columnas a 'rounds' si la base de datos ya existe (lógica de migración simple) ---
-        # Intentamos leer de la columna; si falla (OperationalError), la añadimos.
-        try:
-            cursor.execute("SELECT round_type FROM rounds LIMIT 1")
-        except sqlite3.OperationalError:
-            cursor.execute("ALTER TABLE rounds ADD COLUMN round_type TEXT NOT NULL DEFAULT 'scheduled'")
-            logger.info("Columna 'round_type' añadida a la tabla 'rounds'.")
-        try:
-            cursor.execute("SELECT creator_telegram_id FROM rounds LIMIT 1")
-        except sqlite3.OperationalError:
-            cursor.execute("ALTER TABLE rounds ADD COLUMN creator_telegram_id TEXT")
-            logger.info("Columna 'creator_telegram_id' añadida a la tabla 'rounds'.")
-        try:
-            cursor.execute("SELECT deleted FROM rounds LIMIT 1")
-        except sqlite3.OperationalError:
-            cursor.execute("ALTER TABLE rounds ADD COLUMN deleted BOOLEAN DEFAULT 0")
-            logger.info("Columna 'deleted' añadida a la tabla 'rounds'.")
-        try:
-            cursor.execute("SELECT simulated_contract_address FROM rounds LIMIT 1")
-        except sqlite3.OperationalError:
-            cursor.execute("ALTER TABLE rounds ADD COLUMN simulated_contract_address TEXT")
-            logger.info("Columna 'simulated_contract_address' añadida a la tabla 'rounds'.")
-        # --- Fin Añadir nuevas columnas a 'rounds' ---
+        # Migraciones para 'rounds'
+        cols_rounds = {
+            "round_type": "TEXT NOT NULL DEFAULT 'scheduled'", "creator_telegram_id": "TEXT",
+            "deleted": "BOOLEAN DEFAULT 0", "simulated_contract_address": "TEXT",
+            "ticket_price_simulated": "REAL DEFAULT 1.0"
+        }
+        for col, col_type in cols_rounds.items():
+            _add_column_if_not_exists(cursor, "rounds", col, col_type)
+        # Asegurar que start_time y end_time sean TEXT
+        # (SQLite es flexible, pero es bueno ser explícito si se cambia de DATETIME a TEXT)
 
 
-        # Tabla para participantes de ronda
-        # round_id: A qué ronda pertenecen
-        # telegram_id: Quién es el participante
-        # assigned_number: El número asignado en esa ronda (1 al número de participantes)
-        # paid_simulated: Si ha "pagado" en la simulación inicial (ya no se usa mucho)
-        # paid_real: Si ha "pagado real" simulado (confirmado pago al contrato simulado). Ahora es true al unirse.
+        # Tabla 'round_participants': Quién participa en qué ronda simulada
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS round_participants (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 round_id INTEGER NOT NULL,
                 telegram_id TEXT NOT NULL,
                 assigned_number INTEGER,
-                paid_simulated BOOLEAN DEFAULT 0,
-                paid_real BOOLEAN DEFAULT 0,
+                paid_real BOOLEAN DEFAULT 0, -- Para el flujo de simulación, esto significa que se unió
+                purchase_time TEXT,       -- Hora de "compra" del boleto simulado (ISO8601 UTC)
                 FOREIGN KEY (round_id) REFERENCES rounds(id),
                 FOREIGN KEY (telegram_id) REFERENCES users(telegram_id),
-                UNIQUE(round_id, telegram_id) -- Un usuario solo puede participar una vez por ronda
+                UNIQUE(round_id, telegram_id)
             )
         ''')
+        _add_column_if_not_exists(cursor, "round_participants", "purchase_time", "TEXT")
+        # Columna 'paid_simulated' se puede eliminar si ya no se usa, 'paid_real' toma su lugar en el contexto de simulación.
 
-        # Tabla para resultados del sorteo
-        # round_id: A qué ronda pertenecen los resultados
-        # drawn_number: El número que salió sorteado
-        # draw_order: El orden en que salió (para múltiples ganadores). Ahora siempre 0.
-        # winner_telegram_id: Quién tenía ese número (si alguien lo tenía)
-        # prize_amount_simulated: Cuánto ganó en la simulación (texto)
-        # prize_amount_real: Cuánto ganó en la simulación (numérico, para cálculos)
+
+        # Tabla 'draw_results': Resultados de los sorteos simulados
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS draw_results (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 round_id INTEGER NOT NULL,
                 drawn_number INTEGER NOT NULL,
-                draw_order INTEGER NOT NULL,
+                draw_order INTEGER NOT NULL, -- Para múltiples ganadores en un mismo sorteo
                 winner_telegram_id TEXT,
-                prize_amount_simulated TEXT,
-                prize_amount_real REAL,
+                prize_amount_simulated TEXT, -- "100.00 unidades"
+                prize_amount_real REAL,      -- 100.00
                 FOREIGN KEY (round_id) REFERENCES rounds(id),
                 FOREIGN KEY (winner_telegram_id) REFERENCES users(telegram_id),
-                UNIQUE(round_id, draw_order) -- Solo un resultado por orden de sorteo por ronda
+                UNIQUE(round_id, draw_order)
             )
         ''')
 
-        # Tabla para registrar la comisión del creador por ronda (Bot, Usuario Creador, Gas Simulado)
-        # round_id: A qué ronda pertenece la comisión
-        # creator_type: Tipo de entidad ('bot', 'user', 'gas_fee')
-        # creator_telegram_id: ID del usuario si creator_type es 'user' (NULL para 'bot' o 'gas_fee')
-        # amount_simulated: Monto de la comisión simulada (texto)
-        # amount_real: Monto de la comisión simulada (numérico)
-        # transaction_id: Opcional: ID de transacción de TON real (puede ser NULL)
+        # Tabla 'creator_commission': Comisiones simuladas
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS creator_commission (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 round_id INTEGER NOT NULL,
-                creator_type TEXT NOT NULL,
-                creator_telegram_id TEXT,
+                creator_type TEXT NOT NULL, -- 'bot', 'user', 'gas_fee'
+                creator_telegram_id TEXT,   -- NULL para bot o gas_fee
                 amount_simulated TEXT,
                 amount_real REAL,
-                transaction_id TEXT,
+                transaction_id TEXT,        -- Placeholder para futuro, podría ser un hash interno
                 FOREIGN KEY (round_id) REFERENCES rounds(id),
                 FOREIGN KEY (creator_telegram_id) REFERENCES users(telegram_id),
-                UNIQUE(round_id, creator_type) -- <-- Clave única compuesta: Una entrada por ronda y tipo de creador
+                UNIQUE(round_id, creator_type, creator_telegram_id) -- Asegurar unicidad
             )
         ''')
-        # --- Añadir nuevas columnas a 'creator_commission' si faltan (lógica de migración simple) ---
+        # Migraciones para 'creator_commission'
+        # (la estructura UNIQUE cambió, puede ser complejo migrar sin borrar/recrear si hay datos)
+
+
+        # --- NUEVAS TABLAS PARA PAGOS TON REALES ---
+        # Tabla 'ton_transactions': Transacciones TON verificadas para compra de boletos
+        # Esta es la tabla principal para el enfoque off-chain del Storefront bot
+        cursor.execute('''CREATE TABLE IF NOT EXISTS ton_transactions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            telegram_id TEXT,          -- Quién hizo el pago (Telegram ID) - Puede ser NULL si no se asocia inmediatamente
+            user_ton_wallet VARCHAR (68) NOT NULL, -- Wallet TON del usuario desde donde pagó
+            bot_ton_wallet VARCHAR (68) NOT NULL,  -- Wallet TON del bot que recibió el pago
+            transaction_hash VARCHAR (64) UNIQUE NOT NULL, -- Hash del mensaje/body_hash de la transacción TON
+            value_nano INTEGER NOT NULL,        -- Monto en nanoTONs
+            comment VARCHAR (100),              -- Comentario de la transacción TON (importante para asociar pago)
+            transaction_time TEXT NOT NULL,     -- Hora de la verificación en el bot (ISO8601 UTC)
+            lottery_round_id_assoc INTEGER,     -- A qué ronda de lotería (tabla 'rounds') se asocia este pago TON
+                                                -- Puede ser NULL si el pago no se pudo asociar o es para otra cosa.
+            FOREIGN KEY (telegram_id) REFERENCES users(telegram_id)
+            -- FOREIGN KEY (lottery_round_id_assoc) REFERENCES rounds(id) -- Deshabilitamos FK aquí si rounds puede ser eliminada lógicamente
+        )''')
+        _add_column_if_not_exists(cursor, "ton_transactions", "lottery_round_id_assoc", "INTEGER")
+        # Aseguramos que telegram_id pueda ser NULL temporalmente si la asociación no es inmediata
+        # (Esto puede requerir una migración ALTER TABLE si la columna ya existía como NOT NULL)
         try:
-            cursor.execute("SELECT creator_type FROM creator_commission LIMIT 1")
-        except sqlite3.OperationalError:
-            cursor.execute("ALTER TABLE creator_commission ADD COLUMN creator_type TEXT NOT NULL DEFAULT 'bot'")
-            logger.info("Columna 'creator_type' añadida a la tabla 'creator_commission'.")
-            # Si se añade creator_type, es probable que también falte creator_telegram_id
-            try:
-                 cursor.execute("SELECT creator_telegram_id FROM creator_commission LIMIT 1")
-            except sqlite3.OperationalError:
-                 cursor.execute("ALTER TABLE creator_commission ADD COLUMN creator_telegram_id TEXT")
-                 logger.info("Columna 'creator_telegram_id' añadida a la tabla 'creator_commission'.")
-        # --- Fin Añadir nuevas columnas a 'creator_commission' ---
+             cursor.execute("INSERT INTO ton_transactions (telegram_id, user_ton_wallet, bot_ton_wallet, transaction_hash, value_nano, transaction_time) VALUES (NULL, 'temp', 'temp', 'temp_hash', 0, 'temp_time')")
+             cursor.execute("DELETE FROM ton_transactions WHERE transaction_hash = 'temp_hash'")
+             conn.commit()
+             logger.info("Columna 'telegram_id' en 'ton_transactions' permite NULL.")
+        except sqlite3.IntegrityError: # Si falla porque hash es UNIQUE y 'temp_hash' ya existe
+             logger.debug("La tabla ton_transactions ya existe y tiene datos. No se verifica si telegram_id permite NULL con inserción temporal.")
+        except sqlite3.OperationalError as e_op: # Si falla porque telegram_id es NOT NULL
+             logger.warning(f"Columna 'telegram_id' en 'ton_transactions' es NOT NULL. Considera ALTER TABLE para permitir NULL si la asociación no es inmediata. Error: {e_op}")
 
 
-        conn.commit() # Confirmar todos los cambios pendientes en la base de datos
-        logger.info("Tablas y columnas de base de datos creadas o verificadas.")
+        logger.info(f"Base de datos '{db_name}' inicializada y tablas verificadas/actualizadas.")
 
     except sqlite3.Error as e:
-        logger.error(f"Error al inicializar/actualizar la base de datos: {e}")
-        # En un bot de producción, podrías querer salir o manejar este error de forma más robusta.
+        logger.error(f"Error al inicializar/actualizar la base de datos '{db_name}': {e}", exc_info=True)
     finally:
         if conn:
-            conn.close() # Asegurarse de cerrar la conexión
+            conn.close()
 
+# --- Funciones de Usuario (Generales y TON) ---
+def get_or_create_user(telegram_id: str, username: str | None, first_name: str | None) -> None:
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT telegram_id, username, first_name FROM users WHERE telegram_id = ?", (telegram_id,))
+        user_row = cursor.fetchone()
+        
+        db_username = username if username is not None else ""
+        db_first_name = first_name if first_name is not None else ""
 
-# --- Funciones de Interacción con la Base de Datos ---
-# Estas funciones encapsulan la lógica de acceso directo a la DB.
+        if user_row is None:
+            cursor.execute("INSERT INTO users (telegram_id, username, first_name) VALUES (?, ?, ?)",
+                           (telegram_id, db_username, db_first_name))
+            conn.commit()
+            logger.info(f"Usuario creado: ID {telegram_id}, @{db_username}, Nombre: {db_first_name}")
+        else:
+            # Actualizar username o first_name si han cambiado o eran nulos y ahora tienen valor
+            needs_update = False
+            update_query = "UPDATE users SET "
+            params = []
+            if db_username and user_row["username"] != db_username:
+                update_query += "username = ?, "
+                params.append(db_username)
+                needs_update = True
+            if db_first_name and user_row["first_name"] != db_first_name:
+                update_query += "first_name = ?, "
+                params.append(db_first_name)
+                needs_update = True
+            
+            if needs_update:
+                update_query = update_query.strip(", ") + " WHERE telegram_id = ?"
+                params.append(telegram_id)
+                cursor.execute(update_query, tuple(params))
+                conn.commit()
+                logger.info(f"Datos de usuario actualizados para ID {telegram_id}")
+                
+    except sqlite3.Error as e:
+        logger.error(f"Error al obtener o crear usuario {telegram_id}: {e}", exc_info=True)
+    finally:
+        if conn:
+            conn.close()
 
-def get_db_connection():
-    """Establece una conexión a la base de datos SQLite."""
-    # Puedes añadir lógica aquí para manejar múltiples hilos si es necesario,
-    # aunque SQLite tiene limitaciones. Para una aplicación más grande, SQLAlchemy es mejor.
-    # Para la depuración de transacciones, es útil tener isolation_level=None
-    # pero el comportamiento estándar es suficiente si las transacciones se manejan externamente.
-    return sqlite3.connect(DATABASE_NAME)
+def update_user_ton_wallet(telegram_id: str, ton_wallet_address: str | None):
+    """Asocia o actualiza la wallet TON de un usuario."""
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        # Asegurar que el usuario exista (get_or_create_user debería haberse llamado antes)
+        cursor.execute("UPDATE users SET ton_wallet = ? WHERE telegram_id = ?", (ton_wallet_address, telegram_id))
+        conn.commit()
+        if cursor.rowcount > 0:
+            logger.info(f"Wallet TON para usuario {telegram_id} actualizada a: {ton_wallet_address}")
+        else:
+            # Podría ser que el usuario no exista, o la wallet ya era la misma.
+            # get_or_create_user debe llamarse en el flujo del bot antes de esto.
+            logger.warning(f"No se actualizó wallet TON para {telegram_id} (¿usuario no existe o wallet sin cambios?). Intentando asegurar usuario y reintentar.")
+            # Este reintento es una salvaguarda; idealmente, get_or_create_user ya se ejecutó.
+            cursor.execute("INSERT OR IGNORE INTO users (telegram_id) VALUES (?)", (telegram_id,))
+            cursor.execute("UPDATE users SET ton_wallet = ? WHERE telegram_id = ?", (ton_wallet_address, telegram_id))
+            conn.commit()
+            if cursor.rowcount > 0:
+                 logger.info(f"Wallet TON establecida finalmente para {telegram_id} a: {ton_wallet_address}")
 
-def get_or_create_user(telegram_id: str, username: str) -> None:
+    except sqlite3.Error as e:
+        logger.error(f"Error actualizando wallet TON para {telegram_id}: {e}", exc_info=True)
+    finally:
+        if conn:
+            conn.close()
+
+def get_user_ton_wallet(telegram_id: str) -> str | None:
+    """Obtiene la wallet TON registrada de un usuario."""
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT ton_wallet FROM users WHERE telegram_id = ?", (telegram_id,))
+        result = cursor.fetchone()
+        return result["ton_wallet"] if result and result["ton_wallet"] else None
+    except sqlite3.Error as e:
+        logger.error(f"Error obteniendo wallet TON para {telegram_id}: {e}", exc_info=True)
+        return None
+    finally:
+        if conn:
+            conn.close()
+
+# --- Funciones para Transacciones TON (Verificación de Pagos Off-chain) ---
+
+def add_ton_transaction(
+    telegram_id: str | None, user_ton_wallet: str, bot_ton_wallet: str,
+    transaction_hash: str, value_nano: int, comment: str | None, 
+    lottery_round_id_assoc: int | None = None
+) -> int | None:
+    """Guarda una transacción TON verificada y la asocia a un usuario (si se conoce)."""
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        tx_time_utc_iso = datetime.now(timezone.utc).isoformat()
+        
+        # Asegurar que el usuario exista si se proporciona telegram_id
+        if telegram_id:
+             # get_or_create_user(telegram_id, None, None) # Esto se haría en el handler antes de llamar a find_transaction
+             update_user_ton_wallet(telegram_id, user_ton_wallet) # Asegurar que la wallet del usuario está registrada
+
+        cursor.execute(
+            """INSERT INTO ton_transactions 
+               (telegram_id, user_ton_wallet, bot_ton_wallet, transaction_hash, value_nano, comment, transaction_time, lottery_round_id_assoc)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (telegram_id, user_ton_wallet, bot_ton_wallet, transaction_hash, value_nano, comment, tx_time_utc_iso, lottery_round_id_assoc)
+        )
+        conn.commit()
+        tx_db_id = cursor.lastrowid
+        logger.info(f"Transacción TON {transaction_hash[:10]}... guardada con ID {tx_db_id} para usuario {telegram_id}, asociada a ronda {lottery_round_id_assoc}.")
+        return tx_db_id
+    except sqlite3.IntegrityError:
+        logger.warning(f"Transacción TON con hash {transaction_hash[:10]}... ya existe. No se añadió.")
+        return None # O podrías buscar el ID existente si es necesario
+    except sqlite3.Error as e:
+        logger.error(f"Error guardando transacción TON {transaction_hash[:10]}...: {e}", exc_info=True)
+        return None
+    finally:
+        if conn:
+            conn.close()
+
+# --- Funciones check_transaction y add_v_transaction esperadas por ton_api.py ---
+# Estas funciones se adaptan para usar la nueva tabla ton_transactions
+
+def check_transaction(transaction_hash: str) -> bool:
     """
-    Busca un usuario por telegram_id. Si no existe, lo crea.
+    Verifica si una transacción con el dado hash ya existe en la tabla ton_transactions.
+    Esta es la función esperada por ton_api.py del Storefront bot.
+    Retorna True si existe, False si no.
     """
     conn = None
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
-        cursor.execute("SELECT telegram_id FROM users WHERE telegram_id = ?", (telegram_id,))
-        user = cursor.fetchone()
-        if user is None:
-            # Crear nuevo usuario si no existe
-            cursor.execute("INSERT INTO users (telegram_id, username) VALUES (?, ?)", (telegram_id, username))
-            conn.commit()
-            logger.info(f"Usuario creado: {username} ({telegram_id})")
+        cursor.execute("SELECT id FROM ton_transactions WHERE transaction_hash = ?", (transaction_hash,))
+        result = cursor.fetchone()
+        if result:
+            logger.debug(f"check_transaction: Hash {transaction_hash[:10]}... encontrado en DB.")
+            return True # El hash existe en la base de datos
+        else:
+            logger.debug(f"check_transaction: Hash {transaction_hash[:10]}... NO encontrado en DB.")
+            return False # El hash no existe
+
     except sqlite3.Error as e:
-        logger.error(f"Error al obtener o crear usuario {telegram_id}: {e}")
+        logger.error(f"Error al verificar transacción en DB: {e}", exc_info=True)
+        # Si hay un error de DB al verificar, asumimos que no está verificada
+        # para evitar perder transacciones, pero logueamos el error.
+        return False
+
+def add_v_transaction(source: str, tx_hash: str, value: int, comment: str) -> bool:
+    """
+    Añade una transacción verificada a la tabla ton_transactions.
+    Esta es la función esperada por ton_api.py del Storefront bot.
+    En este contexto, necesitamos obtener el telegram_id del usuario que se espera
+    que haya enviado esta transacción. Esto no es trivial solo con la wallet de origen.
+    La forma más limpia es que find_transaction en ton_api.py obtenga el telegram_id
+    (quizás buscando en la tabla users por la wallet de origen) y el bot_ton_wallet (de config)
+    y llame directamente a add_ton_transaction con todos los datos.
+
+    Sin embargo, para que ton_api.py compile usando esta función, la mantenemos,
+    pero su funcionalidad real es limitada sin el telegram_id y bot_ton_wallet.
+    Intentaremos llamar a add_ton_transaction con valores conocidos o NULL.
+    """
+    logger.warning("Llamada a add_v_transaction. Idealmente, find_transaction debería llamar a add_ton_transaction con más datos (telegram_id, bot_wallet).")
+    
+    # Intentamos obtener el telegram_id asociado a esta wallet de origen
+    # Esto requiere que el usuario haya registrado su wallet previamente
+    conn = None
+    telegram_id_assoc = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT telegram_id FROM users WHERE ton_wallet = ?", (source,))
+        user_row = cursor.fetchone()
+        if user_row:
+            telegram_id_assoc = user_row["telegram_id"]
+            logger.debug(f"add_v_transaction: Wallet {source} asociada a telegram_id {telegram_id_assoc}.")
+        else:
+             logger.warning(f"add_v_transaction: No se encontró telegram_id asociado a la wallet de origen {source}. La transacción se guardará sin asociación directa a usuario Telegram.")
+    except sqlite3.Error as e:
+        logger.error(f"Error buscando telegram_id para wallet {source}: {e}", exc_info=True)
+        # Continuamos aunque no podamos asociar el telegram_id
+
+
+    # Necesitamos el bot_ton_wallet. Idealmente, ton_api.py lo pasaría.
+    # Como no lo hace, lo obtenemos de config.json aquí, lo cual no es ideal
+    # por acoplamiento, pero permite que la función intente guardar.
+    bot_wallet_from_config = None
+    try:
+        config_path = os.path.join(os.path.dirname(__file__), '..', 'config.json')
+        with open(config_path, 'r') as f:
+            config_json = json.load(f)
+            work_mode = config_json.get('WORK_MODE', 'testnet')
+            if work_mode == 'mainnet':
+                bot_wallet_from_config = config_json.get('MAINNET_WALLET')
+            else:
+                bot_wallet_from_config = config_json.get('TESTNET_WALLET')
+    except Exception as e:
+        logger.error(f"Error obteniendo bot_wallet de config para add_v_transaction: {e}", exc_info=True)
+        # Continuamos, bot_ton_wallet será None si falla
+
+    # Ahora llamamos a add_ton_transaction con los datos disponibles
+    # add_ton_transaction maneja la unicidad por hash
+    added_successfully = add_ton_transaction(
+        telegram_id=telegram_id_assoc,
+        user_ton_wallet=source,
+        bot_ton_wallet=bot_wallet_from_config if bot_wallet_from_config else "UNKNOWN_BOT_WALLET", # Usar placeholder si no se obtiene
+        transaction_hash=tx_hash,
+        value_nano=value,
+        comment=comment,
+        lottery_round_id_assoc=None # No asociamos a ronda de lotería simulada aquí
+    )
+
+    # add_ton_transaction retorna el ID si es exitoso, None si falla o ya existe.
+    # Queremos que add_v_transaction retorne True si se registró (nuevo o ya existía), False si hubo un error de DB.
+    # check_transaction ya nos dice si existe. Si llegamos aquí, no existía.
+    # Entonces, si added_successfully no es None, significa que se añadió.
+    return added_successfully is not None
+
+
+def get_user_ton_payments_history(telegram_id: str) -> list[dict]:
+    """Obtiene el historial de pagos TON verificados de un usuario."""
+    conn = None
+    payments = []
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT transaction_hash, value_nano, comment, transaction_time, lottery_round_id_assoc, user_ton_wallet "
+            "FROM ton_transactions WHERE telegram_id = ? ORDER BY transaction_time DESC",
+            (telegram_id,)
+        )
+        for row in cursor.fetchall():
+            payments.append(dict(row))
+        return payments
+    except sqlite3.Error as e:
+        logger.error(f"Error obteniendo historial de pagos TON para {telegram_id}: {e}", exc_info=True)
+        return []
     finally:
         if conn:
             conn.close()
 
 
-def create_new_round(round_type: str, creator_telegram_id: str | None) -> int | None:
-    """
-    Crea una nueva ronda en la base de datos con estado 'waiting_to_start', tipo y creador opcional.
-    Genera y guarda la dirección simulada del Smart Contract para la ronda.
-    Es llamada desde round_manager.py.
-    Retorna el ID de la nueva ronda o None si hay error.
-    """
+# --- Funciones para Rondas de Lotería (Simuladas, adaptadas de tu original) ---
+# Estas funciones son para la lógica de simulación si aún la necesitas.
+# Si tu bot solo usará pagos TON reales, puedes eliminar o ignorar estas funciones
+# y las tablas 'rounds', 'round_participants', 'draw_results', 'creator_commission'.
+
+def create_new_round(round_type: str, creator_telegram_id: str | None, ticket_price: float = 1.0) -> int | None:
+    """Crea una nueva ronda (simulada) y retorna su ID."""
     conn = None
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
+        now_utc_iso = datetime.now(timezone.utc).isoformat()
+        
+        # Asegurar que el creador (si es un usuario) exista
+        if creator_telegram_id:
+            # get_or_create_user(creator_telegram_id, None, None) # Esto se haría en el handler
+            pass
+
+
         cursor.execute(
-            "INSERT INTO rounds (status, round_type, creator_telegram_id) VALUES (?, ?, ?)",
-            ('waiting_to_start', round_type, creator_telegram_id)
+            "INSERT INTO rounds (start_time, status, round_type, creator_telegram_id, ticket_price_simulated) VALUES (?, ?, ?, ?, ?)",
+            (now_utc_iso, 'waiting_to_start', round_type, creator_telegram_id, ticket_price)
         )
         round_id = cursor.lastrowid
+        if not round_id:
+            logger.error("No se pudo obtener round_id después de la inserción.")
+            return None
 
-        simulated_addr = generate_simulated_smart_contract_address(round_id)
-
-        cursor.execute(
-            "UPDATE rounds SET simulated_contract_address = ? WHERE id = ?",
-            (simulated_addr, round_id)
-        )
-
+        sim_addr = generate_simulated_smart_contract_address(round_id)
+        cursor.execute("UPDATE rounds SET simulated_contract_address = ? WHERE id = ?", (sim_addr, round_id))
         conn.commit()
-        logger.info(f"Nueva ronda de tipo '{round_type}' creada en DB con ID: {round_id}, Dirección Simulada: {simulated_addr} (Creador: {creator_telegram_id}).")
+        logger.info(f"Nueva ronda simulada '{round_type}' ID:{round_id}, Precio:{ticket_price} (Creador:{creator_telegram_id}) creada.")
         return round_id
     except sqlite3.Error as e:
-        logger.error(f"Error al crear nueva ronda de tipo '{round_type}' en DB: {e}")
+        logger.error(f"Error creando nueva ronda simulada '{round_type}': {e}", exc_info=True)
         if conn: conn.rollback()
         return None
     finally:
         if conn:
             conn.close()
 
-
-def get_active_round() -> tuple | None:
-    """
-    Busca la ronda activa actual (estado 'waiting_to_start' o 'waiting_for_payments')
-    que NO esté marcada como eliminada. Es llamada desde round_manager.py.
-    Retorna una tupla con los datos de la ronda o None si no hay ronda activa.
-    Retorna (id, start_time, end_time, status, round_type, creator_telegram_id, deleted, simulated_contract_address)
-    """
+def get_round_by_id(round_id: int) -> dict | None:
+    """Obtiene datos de una ronda simulada por su ID."""
     conn = None
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
         cursor.execute(
-            "SELECT id, start_time, end_time, status, round_type, creator_telegram_id, deleted, simulated_contract_address FROM rounds WHERE status IN (?, ?) AND deleted = 0 ORDER BY start_time DESC LIMIT 1",
-            ('waiting_to_start', 'waiting_for_payments')
-        )
-        round_data = cursor.fetchone()
-
-        if round_data:
-            round_data = list(round_data)
-            round_data[6] = bool(round_data[6])
-            round_data = tuple(round_data)
-
-            logger.debug(f"Ronda activa encontrada en DB: {round_data}")
-        else:
-            logger.debug("No se encontró ronda activa en DB.")
-
-        return round_data
+            "SELECT * FROM rounds WHERE id = ?", (round_id,))
+        row = cursor.fetchone()
+        return dict(row) if row else None
     except sqlite3.Error as e:
-        logger.error(f"Error al obtener ronda activa de DB: {e}")
+        logger.error(f"Error obteniendo ronda simulada ID {round_id}: {e}", exc_info=True)
         return None
     finally:
         if conn:
             conn.close()
-
-
-def get_round_by_id(round_id: int) -> tuple | None:
-    """
-    Busca una ronda específica por su ID. Es llamada desde round_manager.py.
-    Retorna una tupla con los datos de la ronda o None si no existe.
-    Retorna (id, start_time, end_time, status, round_type, creator_telegram_id, deleted, simulated_contract_address)
-    """
+            
+def get_active_round() -> dict | None:
+    """Obtiene la ronda simulada activa (waiting_to_start o waiting_for_payments, no eliminada)."""
     conn = None
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
         cursor.execute(
-            "SELECT id, start_time, end_time, status, round_type, creator_telegram_id, deleted, simulated_contract_address FROM rounds WHERE id = ?",
-            (round_id,)
+            "SELECT * FROM rounds WHERE status IN (?, ?) AND deleted = 0 ORDER BY id DESC LIMIT 1",
+            ('waiting_to_start', 'waiting_for_payments')
         )
-        round_data = cursor.fetchone()
-
-        if round_data:
-            round_data = list(round_data)
-            round_data[6] = bool(round_data[6])
-            round_data = tuple(round_data)
-
-            logger.debug(f"Ronda encontrada por ID {round_id}: {round_data}")
-        else:
-            logger.debug(f"No se encontró ronda con ID {round_id}.")
-
-        return round_data
+        row = cursor.fetchone()
+        return dict(row) if row else None
     except sqlite3.Error as e:
-        logger.error(f"Error al obtener ronda por ID {round_id} de DB: {e}")
+        logger.error(f"Error obteniendo ronda simulada activa: {e}", exc_info=True)
         return None
     finally:
         if conn:
             conn.close()
-
-
-def get_open_rounds() -> list[tuple]:
-    """
-    Obtiene una lista de rondas que están abiertas ('waiting_to_start' o 'waiting_for_payments')
-    y NO marcadas como eliminadas. Es llamada desde round_manager.py.
-    Retorna una lista de tuplas.
-    Retorna (id, start_time, status, round_type, simulated_contract_address)
-    """
+            
+def get_rounds_by_status(status_list: list[str], check_deleted: bool = False) -> list[dict]:
+    """Obtiene rondas simuladas por lista de estados."""
     conn = None
-    rounds_list = []
+    rounds = []
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
-        cursor.execute(
-            "SELECT id, start_time, status, round_type, simulated_contract_address FROM rounds WHERE status IN (?, ?) AND deleted = 0 ORDER BY start_time DESC",
-            ('waiting_to_start', 'waiting_for_payments')
-        )
-        rounds_list = cursor.fetchall()
-
-        logger.debug(f"Obtenidas {len(rounds_list)} rondas abiertas.")
-    except sqlite3.Error as e:
-        logger.error(f"Error al obtener rondas abiertas de DB: {e}")
-    finally:
-        if conn:
-            conn.close()
-
-    return rounds_list
-
-
-def get_rounds_by_status(status_list: list[str], check_deleted: bool = False) -> list[tuple]:
-    """
-    Obtiene una lista de rondas por sus estados. Es llamada desde bot.py (JobQueue).
-    Incluye opción para filtrar por el flag 'deleted'.
-    Retorna una lista de tuplas (id, start_time, status, round_type, creator_telegram_id, deleted, simulated_contract_address).
-    """
-    conn = None
-    rounds_list = []
-    try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-
-        status_placeholders = ', '.join(['?' for _ in status_list])
-        sql = f"SELECT id, start_time, status, round_type, creator_telegram_id, deleted, simulated_contract_address FROM rounds WHERE status IN ({status_placeholders})"
-        query_params = status_list
-
+        placeholders = ','.join(['?'] * len(status_list))
+        sql = f"SELECT * FROM rounds WHERE status IN ({placeholders})"
+        params = list(status_list)
         if check_deleted:
             sql += " AND deleted = 0"
-
-        sql += " ORDER BY start_time DESC"
-
-        cursor.execute(sql, tuple(query_params))
-        rounds_list = cursor.fetchall()
-
-        logger.debug(f"Obtenidas {len(rounds_list)} rondas con estados {status_list} (check_deleted={check_deleted}).")
+        sql += " ORDER BY id DESC"
+        cursor.execute(sql, params)
+        for row in cursor.fetchall():
+            rounds.append(dict(row))
+        return rounds
     except sqlite3.Error as e:
-        logger.error(f"Error al obtener rondas por estados {status_list} de DB: {e}")
+        logger.error(f"Error obteniendo rondas simuladas por status {status_list}: {e}", exc_info=True)
+        return []
     finally:
         if conn:
             conn.close()
-
-    return rounds_list
-
 
 def add_participant_to_round(round_id: int, telegram_id: str, assigned_number: int) -> bool:
-    """
-    Añade un usuario como participante a una ronda específica.
-    Retorna True si se añadió correctamente, False si ya participaba o hubo error.
-    Es llamada desde round_manager.py.
-    """
+    """Añade un participante a una ronda simulada (implica "pago simulado" hecho)."""
     conn = None
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
+        now_utc_iso = datetime.now(timezone.utc).isoformat()
+        # get_or_create_user(telegram_id, None, None) # Asegurar que el usuario existe (se haría en handler)
         cursor.execute(
-            "INSERT INTO round_participants (round_id, telegram_id, assigned_number) VALUES (?, ?, ?)",
-            (round_id, telegram_id, assigned_number)
+            "INSERT INTO round_participants (round_id, telegram_id, assigned_number, paid_real, purchase_time) VALUES (?, ?, ?, 1, ?)",
+            (round_id, telegram_id, assigned_number, now_utc_iso)
         )
         conn.commit()
-        logger.info(f"Participante {telegram_id} añadido a ronda {round_id} con número {assigned_number}.")
+        logger.info(f"Participante {telegram_id} añadido a ronda simulada {round_id} con número {assigned_number}.")
         return True
-    except sqlite3.IntegrityError:
-        logger.warning(f"Participante {telegram_id} ya estaba en ronda {round_id}.")
+    except sqlite3.IntegrityError: # Usuario ya en la ronda
+        logger.warning(f"Participante {telegram_id} ya estaba en ronda simulada {round_id}.")
         return False
     except sqlite3.Error as e:
-        logger.error(f"Error al añadir participante {telegram_id} a ronda {round_id}: {e}")
+        logger.error(f"Error añadiendo participante {telegram_id} a ronda simulada {round_id}: {e}", exc_info=True)
         if conn: conn.rollback()
         return False
     finally:
         if conn:
             conn.close()
 
-
-def get_participants_in_round(round_id: int) -> list[tuple]:
-    """
-    Obtiene la lista de participantes (telegram_id, username, assigned_number, paid_simulated, paid_real)
-    para una ronda específica. Es llamada desde round_manager.py y handlers.py.
-    Retorna una lista de tuplas.
-    """
+def get_participants_in_round(round_id: int) -> list[dict]:
+    """Obtiene participantes de una ronda simulada."""
     conn = None
-    participants_list = []
+    participants = []
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
-        # Usamos LEFT JOIN para incluir participantes incluso si su usuario no está en la tabla users (aunque get_or_create_user debería evitar esto)
-        # Esto puede ayudar a diagnosticar si faltan usuarios.
         cursor.execute(
-            """
-            SELECT
-                rp.telegram_id,
-                u.username, -- Será NULL if no matching user
-                rp.assigned_number,
-                rp.paid_simulated,
-                rp.paid_real
-            FROM round_participants rp
-            LEFT JOIN users u ON rp.telegram_id = u.telegram_id -- <-- CAMBIO: Usar LEFT JOIN
-            WHERE rp.round_id = ?
-            ORDER BY rp.assigned_number
-            """,
+            """SELECT rp.telegram_id, u.username, u.first_name, rp.assigned_number, rp.paid_real, rp.purchase_time
+               FROM round_participants rp
+               LEFT JOIN users u ON rp.telegram_id = u.telegram_id
+               WHERE rp.round_id = ? ORDER BY rp.assigned_number""",
             (round_id,)
         )
-        participants_list = cursor.fetchall()
-
-        participants_list = [list(p) for p in participants_list]
-        for p in participants_list:
-            p[3] = bool(p[3])
-            p[4] = bool(p[4])
-        participants_list = [tuple(p) for p in participants_list]
-
-        # --- AÑADE ESTE LOG DE DEPURACIÓN AQUÍ ---
-        logger.debug(f"Datos brutos de participantes obtenidos de DB para ronda {round_id}: {participants_list}") # <-- Nuevo log
-
-        logger.debug(f"Obtenidos {len(participants_list)} participantes para ronda {round_id}.")
+        for row in cursor.fetchall():
+            participants.append(dict(row))
+        return participants
     except sqlite3.Error as e:
-        logger.error(f"Error al obtener participantes para ronda {round_id}: {e}")
+        logger.error(f"Error obteniendo participantes de ronda simulada {round_id}: {e}", exc_info=True)
+        return []
     finally:
         if conn:
             conn.close()
 
-    return participants_list
-
-
-def count_participants_in_round(round_id: int) -> int:
-    """
-    Cuenta el número de participantes en una ronda específica. Es llamada desde round_manager.py.
-    Retorna el número de participantes.
-    """
-    conn = None
-    count = 0
-    try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute("SELECT COUNT(*) FROM round_participants WHERE round_id = ?", (round_id,))
-        count = cursor.fetchone()[0]
-        logger.debug(f"Contados {count} participantes en ronda {round_id}.")
-    except sqlite3.Error as e:
-        logger.error(f"Error al contar participantes en ronda {round_id}: {e}")
-    finally:
-        if conn:
-            conn.close()
-
-    return count
-
-
-def update_participant_paid_status(round_id: int, telegram_id: str, paid_simulated: bool = None, paid_real: bool = None) -> bool:
-    """
-    Actualiza el estado de pago simulado y/o pago real de un participante en una ronda específica.
-    Si un parámetro de pago es None, no se actualiza ese campo.
-    Retorna True si se actualizó, False si no se encontró o hubo error.
-    Es llamada desde payment_manager.py y round_manager.py.
-    """
+def count_round_participants(round_id: int) -> int:
+    """Cuenta participantes en una ronda simulada (asume que son los que 'pagaron' al unirse)."""
     conn = None
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
-
-        update_fields = []
-        update_values = []
-
-        if paid_simulated is not None:
-            update_fields.append("paid_simulated = ?")
-            update_values.append(1 if paid_simulated else 0)
-        if paid_real is not None:
-            update_fields.append("paid_real = ?")
-            update_values.append(1 if paid_real else 0)
-
-        if not update_fields:
-             logger.warning("Llamada a update_participant_paid_status sin campos para actualizar.")
-             return False
-
-        sql = f"UPDATE round_participants SET {', '.join(update_fields)} WHERE round_id = ? AND telegram_id = ?"
-        update_values.extend([round_id, telegram_id])
-
-        cursor.execute(sql, tuple(update_values))
-        conn.commit()
-
-        if cursor.rowcount > 0:
-            logger.info(f"Estado de pago (simulado={paid_simulated}, real={paid_real}) actualizado para participante {telegram_id} en ronda {round_id}.")
-            return True
-        else:
-            logger.warning(f"No se encontró participante {telegram_id} en ronda {round_id} para actualizar pago.")
-            return False
+        cursor.execute("SELECT COUNT(id) FROM round_participants WHERE round_id = ? AND paid_real = 1", (round_id,))
+        result = cursor.fetchone()
+        return result[0] if result else 0
     except sqlite3.Error as e:
-        logger.error(f"Error al actualizar estado de pago para participante {telegram_id} en ronda {round_id}: {e}")
-        if conn: conn.rollback()
-        return False
+        logger.error(f"Error contando participantes de ronda simulada {round_id}: {e}", exc_info=True)
+        return 0
     finally:
         if conn:
             conn.close()
-
-
-def count_paid_participants_in_round(round_id: int, use_real_paid: bool = False) -> int:
-    """
-    Cuenta el número de participantes con paid_simulated = TRUE o paid_real = TRUE
-    en una ronda específica. Es llamada desde payment_manager.py y bot.py (JobQueue).
-    use_real_paid=True para contar pagos reales, False para pagos simulados.
-    Retorna el número de participantes pagados.
-    """
-    conn = None
-    count = 0
-    try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        if use_real_paid:
-             cursor.execute("SELECT COUNT(*) FROM round_participants WHERE round_id = ? AND paid_real = 1", (round_id,))
-        else:
-             cursor.execute("SELECT COUNT(*) FROM round_participants WHERE round_id = ? AND paid_simulated = 1", (round_id,))
-        count = cursor.fetchone()[0]
-        logger.debug(f"Contados {count} pagos {'reales simulados' if use_real_paid else 'simulados'} en ronda {round_id}.")
-    except sqlite3.Error as e:
-        logger.error(f"Error al contar pagos en ronda {round_id}: {e}")
-    finally:
-        if conn:
-            conn.close()
-
-    return count
-
 
 def update_round_status(round_id: int, new_status: str) -> bool:
-    """
-    Actualiza el estado de una ronda en la base de datos.
-    Si el estado es 'finished' o 'cancelled', también establece la hora de fin.
-    Retorna True si se actualizó, False si no se encontró o hubo error.
-    Es llamada desde round_manager.py.
-    """
+    """Actualiza el estado de una ronda simulada."""
     conn = None
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
-        current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-
+        now_utc_iso = datetime.now(timezone.utc).isoformat()
+        sql = "UPDATE rounds SET status = ?"
+        params = [new_status]
         if new_status in ['finished', 'cancelled']:
-             cursor.execute(
-                "UPDATE rounds SET status = ?, end_time = ? WHERE id = ?",
-                (new_status, current_time, round_id)
-             )
-        else:
-            cursor.execute(
-                "UPDATE rounds SET status = ? WHERE id = ?",
-                (new_status, round_id)
-            )
-
+            sql += ", end_time = ?"
+            params.append(now_utc_iso)
+        sql += " WHERE id = ?"
+        params.append(round_id)
+        
+        cursor.execute(sql, tuple(params))
         conn.commit()
-
-        if cursor.rowcount > 0:
-            logger.info(f"Estado de ronda {round_id} actualizado a '{new_status}'.")
-            return True
+        updated_rows = cursor.rowcount
+        if updated_rows > 0:
+            logger.info(f"Estado de ronda simulada {round_id} actualizado a '{new_status}'.")
         else:
-            logger.warning(f"No se encontró ronda con ID {round_id} para actualizar estado.")
-            return False
+            logger.warning(f"No se actualizó estado para ronda simulada {round_id} (¿no existe o estado ya era el mismo?).")
+        return updated_rows > 0
     except sqlite3.Error as e:
-        logger.error(f"Error al actualizar estado de ronda {round_id} a '{new_status}': {e}")
+        logger.error(f"Error actualizando estado de ronda simulada {round_id}: {e}", exc_info=True)
         if conn: conn.rollback()
         return False
     finally:
         if conn:
             conn.close()
-
-
-def mark_round_as_deleted(round_id: int) -> bool:
-    """
-    Marca una ronda como eliminada lógicamente en la base de datos.
-    Retorna True si se marcó, False si no se encontró o hubo error.
-    Es llamada desde round_manager.py.
-    """
-    conn = None
-    try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute(
-            "UPDATE rounds SET deleted = 1 WHERE id = ?",
-            (round_id,)
-        )
-        conn.commit()
-
-        if cursor.rowcount > 0:
-            logger.info(f"Ronda {round_id} marcada como eliminada.")
-            return True
-        else:
-            logger.warning(f"No se encontró ronda con ID {round_id} para marcar como eliminada.")
-            return False
-    except sqlite3.Error as e:
-        logger.error(f"Error al marcar ronda {round_id} como eliminada: {e}")
-        if conn: conn.rollback()
-        return False
-    finally:
-        if conn:
-            conn.close()
-
 
 def save_draw_results(round_id: int, results_list: list[dict]) -> bool:
-    """
-    Guarda los resultados del sorteo para una ronda en la tabla draw_results.
-    results_list es una lista de diccionarios como:
-    {'drawn_number': int, 'draw_order': int, 'winner_telegram_id': str | None,
-     'prize_amount_simulated': str, 'prize_amount_real': float | None}
-    Es llamada desde payment_manager.py.
-    Retorna True si se guardó, False si hubo error.
-    """
+    """Guarda resultados de un sorteo simulado."""
     conn = None
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
-        # La restricción UNIQUE(round_id, draw_order) en la tabla draw_results ayudará con esto.
+        # Iniciar transacción explícitamente para inserciones múltiples
+        conn.execute("BEGIN TRANSACTION")
+        for r_data in results_list:
+            cursor.execute(
+                """INSERT INTO draw_results 
+                   (round_id, drawn_number, draw_order, winner_telegram_id, prize_amount_simulated, prize_amount_real) 
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (round_id, r_data.get('drawn_number'), r_data.get('draw_order'), r_data.get('winner_telegram_id'),
+                 r_data.get('prize_amount_simulated'), r_data.get('prize_amount_real'))
+            )
+        conn.commit() # Commit al final si todo va bien
+        logger.info(f"Resultados del sorteo simulado para ronda {round_id} guardados.")
+        return True
+    except sqlite3.IntegrityError as ie: # Ej. UNIQUE constraint falló
+        logger.warning(f"Error de integridad guardando resultados de sorteo para ronda {round_id}: {ie}")
+        if conn: conn.rollback()
+        return False
+    except sqlite3.Error as e:
+        logger.error(f"Error guardando resultados de sorteo para ronda {round_id}: {e}", exc_info=True)
+        if conn: conn.rollback()
+        return False
+    finally:
+        if conn:
+            conn.close()
 
-        data_to_insert = []
-        for r in results_list:
-             data_to_insert.append((
-                 round_id,
-                 r.get('drawn_number'),
-                 r.get('draw_order'),
-                 r.get('winner_telegram_id'),
-                 r.get('prize_amount_simulated'),
-                 r.get('prize_amount_real')
-             ))
-
-
-        cursor.executemany(
-            """
-            INSERT INTO draw_results (
-                round_id, drawn_number, draw_order, winner_telegram_id,
-                prize_amount_simulated, prize_amount_real
-            ) VALUES (?, ?, ?, ?, ?, ?)
-            """,
-            data_to_insert
+def save_creator_commission(round_id: int, creator_type: str, creator_telegram_id: str | None,
+                            amount_simulated: str, amount_real: float | None, transaction_id: str | None = None) -> bool:
+    """Guarda una comisión simulada. Esta función ahora maneja su propia conexión."""
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            """INSERT INTO creator_commission
+               (round_id, creator_type, creator_telegram_id, amount_simulated, amount_real, transaction_id)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (round_id, creator_type, creator_telegram_id, amount_simulated, amount_real, transaction_id)
         )
         conn.commit()
-        logger.info(f"Resultados del sorteo guardados para ronda {round_id}.")
+        logger.info(f"Comisión simulada '{creator_type}' para ronda {round_id} guardada.")
         return True
-    except sqlite3.IntegrityError as e:
-         logger.warning(f"Integrity Error al guardar resultados del sorteo para ronda {round_id}: {e}")
-         if conn: conn.rollback()
-         return False
+    except sqlite3.IntegrityError:
+        logger.warning(f"Comisión simulada '{creator_type}' para ronda {round_id} (Creador: {creator_telegram_id}) ya existe.")
+        return False # O True si no se considera un error crítico
     except sqlite3.Error as e:
-        logger.error(f"Error al guardar resultados del sorteo para ronda {round_id}: {e}")
+        logger.error(f"Error guardando comisión simulada '{creator_type}' para ronda {round_id}: {e}", exc_info=True)
         if conn: conn.rollback()
         return False
     finally:
@@ -672,32 +684,147 @@ def save_draw_results(round_id: int, results_list: list[dict]) -> bool:
             conn.close()
 
 
-# save_creator_commission ahora es llamada con un cursor desde payment_manager
-def save_creator_commission(cursor, round_id: int, creator_type: str, creator_telegram_id: str | None, amount_simulated: str, amount_real: float | None, transaction_id: str | None = None) -> bool:
-    """
-    Guarda el registro de la comisión para una ronda usando un cursor proporcionado.
-    No gestiona la conexión ni el commit/rollback. Relanza IntegrityError y otros errores SQLite.
-    Retorna True si la inserción se ejecutó sin errores no-IntegrityError.
-    """
-    try:
-        # La restricción UNIQUE(round_id, creator_type) en la tabla manejará los duplicados.
-        cursor.execute(
-            """
-            INSERT INTO creator_commission (
-                round_id, creator_type, creator_telegram_id, amount_simulated, amount_real, transaction_id
-            ) VALUES (?, ?, ?, ?, ?, ?)
-            """,
-            (round_id, creator_type, creator_telegram_id, amount_simulated, amount_real, transaction_id)
-        )
-        # No hacemos commit aquí.
-        logger.debug(f"Inserción de comisión '{creator_type}' para ronda {round_id} ejecutada (pendiente commit).")
-        return True
-    except sqlite3.IntegrityError as e:
-        # Capturamos IntegrityError aquí para loguear, pero la relanzamos para que el llamador gestione la transacción.
-        logger.warning(f"Intento de guardar comisión duplicada (IntegrityError) para ronda {round_id}, tipo '{creator_type}'. {e}")
-        raise e # Relanzar la excepción
+if __name__ == '__main__':
+    # Configuración básica de logging si se ejecuta directamente
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    # Re-obtener logger después de configurar (para db)
+    logger = logging.getLogger(__name__)
+    logging.getLogger('db').setLevel(logging.INFO) # Mostrar logs de db también
 
-    except sqlite3.Error as e:
-        # Capturamos otros errores SQLite y relanzamos.
-        logger.error(f"Error SQLite al guardar comisión para ronda {round_id}, tipo '{creator_type}': {e}")
-        raise e
+    print("Ejecutando pruebas directas de db.py...")
+
+    DB_TEST_NAME = 'test_db_direct.db'
+    # Limpiar DB de prueba anterior si existe
+    if os.path.exists(DB_TEST_NAME):
+        os.remove(DB_TEST_NAME)
+        logger.info(f"Archivo de DB de prueba '{DB_TEST_NAME}' existente eliminado.")
+
+    init_db(DB_TEST_NAME) # Llama con el nombre de la DB de prueba
+    logger.info(f"Base de datos de prueba '{DB_TEST_NAME}' inicializada/verificada.")
+
+    # --- Pruebas de funciones de usuario ---
+    print("\n--- Pruebas de funciones de usuario ---")
+    get_or_create_user("123", "testuser1", "Test")
+    get_or_create_user("456", "testuser2", "Another")
+    get_or_create_user("123", "testuser1_updated", "Test Updated") # Probar actualización
+
+    update_user_ton_wallet("123", "EQ_test_wallet_1")
+    update_user_ton_wallet("456", "EQ_test_wallet_2")
+    update_user_ton_wallet("999", "EQ_non_existent_user") # Probar usuario no existente
+
+    wallet_123 = get_user_ton_wallet("123")
+    logger.info(f"Wallet para usuario 123: {wallet_123}")
+    wallet_999 = get_user_ton_wallet("999")
+    logger.info(f"Wallet para usuario 999: {wallet_999}")
+
+
+    # --- Pruebas de funciones de transacciones TON ---
+    print("\n--- Pruebas de funciones de transacciones TON ---")
+    test_tx_hash_1 = "hash_tx_1"
+    test_tx_hash_2 = "hash_tx_2"
+    test_tx_hash_1_duplicate = "hash_tx_1" # Hash duplicado
+
+    # Prueba check_transaction
+    check_1_before = check_transaction(test_tx_hash_1)
+    logger.info(f"check_transaction para {test_tx_hash_1}: {check_1_before} (Debería ser False)")
+
+    # Prueba add_ton_transaction
+    added_1 = add_ton_transaction(
+        telegram_id="123",
+        user_ton_wallet="EQ_test_wallet_1",
+        bot_ton_wallet="EQ_bot_wallet",
+        transaction_hash=test_tx_hash_1,
+        value_nano=1000000000,
+        comment="Test Payment 1",
+        lottery_round_id_assoc=None
+    )
+    logger.info(f"add_ton_transaction para {test_tx_hash_1}: ID {added_1} (Debería ser un número)")
+
+    added_2 = add_ton_transaction(
+        telegram_id="456",
+        user_ton_wallet="EQ_test_wallet_2",
+        bot_ton_wallet="EQ_bot_wallet",
+        transaction_hash=test_tx_hash_2,
+        value_nano=500000000,
+        comment="Test Payment 2",
+        lottery_round_id_assoc=1 # Asociar a ronda simulada ID 1 (si existe)
+    )
+    logger.info(f"add_ton_transaction para {test_tx_hash_2}: ID {added_2} (Debería ser un número)")
+    
+    # Prueba add_ton_transaction duplicada
+    added_1_duplicate = add_ton_transaction(
+        telegram_id="123", # Mismo usuario, misma wallet, etc.
+        user_ton_wallet="EQ_test_wallet_1",
+        bot_ton_wallet="EQ_bot_wallet",
+        transaction_hash=test_tx_hash_1_duplicate, # Hash duplicado
+        value_nano=1000000000,
+        comment="Test Payment 1 Duplicate",
+        lottery_round_id_assoc=None
+    )
+    logger.info(f"add_ton_transaction duplicada para {test_tx_hash_1_duplicate}: ID {added_1_duplicate} (Debería ser None)")
+
+
+    # Prueba check_transaction de nuevo
+    check_1_after = check_transaction(test_tx_hash_1)
+    logger.info(f"check_transaction para {test_tx_hash_1}: {check_1_after} (Debería ser True)")
+    check_3_non_existent = check_transaction("hash_non_existent")
+    logger.info(f"check_transaction para hash_non_existent: {check_3_non_existent} (Debería ser False)")
+
+
+    # Prueba add_v_transaction (la función esperada por ton_api.py)
+    # Esta función ahora intenta buscar el telegram_id y bot_ton_wallet
+    print("\n--- Pruebas de add_v_transaction (usada por ton_api.py) ---")
+    test_tx_hash_3 = "hash_tx_3_via_add_v"
+    source_for_add_v = "EQ_test_wallet_1" # Wallet que ya asociamos a user 123
+    value_for_add_v = 3000000000
+    comment_for_add_v = "Payment via add_v"
+
+    check_3_before = check_transaction(test_tx_hash_3)
+    logger.info(f"check_transaction para {test_tx_hash_3}: {check_3_before} (Debería ser False)")
+
+    added_via_v_1 = add_v_transaction(source_for_add_v, test_tx_hash_3, value_for_add_v, comment_for_add_v)
+    logger.info(f"add_v_transaction para {test_tx_hash_3}: {added_via_v_1} (Debería ser True)")
+
+    check_3_after = check_transaction(test_tx_hash_3)
+    logger.info(f"check_transaction para {test_tx_hash_3}: {check_3_after} (Debería ser True)")
+
+    # Prueba add_v_transaction duplicada
+    added_via_v_duplicate = add_v_transaction(source_for_add_v, test_tx_hash_3, value_for_add_v, "Duplicate via add_v")
+    logger.info(f"add_v_transaction duplicada para {test_tx_hash_3}: {added_via_v_duplicate} (Debería ser False)")
+
+
+    # --- Pruebas de historial de pagos TON ---
+    print("\n--- Pruebas de historial de pagos TON ---")
+    history_123 = get_user_ton_payments_history("123")
+    logger.info(f"Historial de pagos TON para usuario 123 ({len(history_123)} transacciones):")
+    for payment in history_123:
+        logger.info(f"  Hash: {payment['transaction_hash'][:10]}..., Valor: {payment['value_nano']}, Comentario: '{payment['comment']}'")
+
+    history_456 = get_user_ton_payments_history("456")
+    logger.info(f"Historial de pagos TON para usuario 456 ({len(history_456)} transacciones):")
+    for payment in history_456:
+        logger.info(f"  Hash: {payment['transaction_hash'][:10]}..., Valor: {payment['value_nano']}, Comentario: '{payment['comment']}'")
+
+    history_non_existent = get_user_ton_payments_history("999")
+    logger.info(f"Historial de pagos TON para usuario 999 ({len(history_non_existent)} transacciones):")
+    if not history_non_existent:
+        logger.info("  Lista vacía como se esperaba.")
+
+
+    # --- Pruebas de funciones de Rondas Simuladas (Opcional) ---
+    # Descomenta y adapta si necesitas probar estas funciones también
+    # print("\n--- Pruebas de Rondas Simuladas ---")
+    # round_id_1 = create_new_round('scheduled', None, 1.0)
+    # if round_id_1:
+    #     logger.info(f"Ronda simulada creada con ID: {round_id_1}")
+    #     add_participant_to_round(round_id_1, "123", 1)
+    #     add_participant_to_round(round_id_1, "456", 2)
+    #     count_p = count_round_participants(round_id_1)
+    #     logger.info(f"Participantes en ronda {round_id_1}: {count_p}")
+    #     update_round_status(round_id_1, 'finished')
+    #     round_data = get_round_by_id(round_id_1)
+    #     logger.info(f"Estado final de ronda {round_id_1}: {round_data.get('status')}")
+
+
+    print("\nPruebas directas de db.py finalizadas.")
+

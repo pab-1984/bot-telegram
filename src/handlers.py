@@ -1,729 +1,444 @@
-# botloteria/src/handlers.py
+# src/handlers.py
 
-# Añadimos este print temporal para verificar si el archivo se carga
-print("--> Cargando handlers.py - Versión Final Integrada y sin Confirmación de Pago <--")
+# --- Importaciones de aiogram ---
+from aiogram import Dispatcher, types # types y Dispatcher aquí
+from aiogram import Bot # Importamos Bot en una línea separada
+# --- Importaciones de Aiogram FSM (Corregidas para v3.x) ---
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+# --- Fin Importaciones Aiogram FSM ---
 
-import os
-# Importaciones necesarias
-# Importamos todas las clases relevantes de telegram
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove, WebAppInfo
-# Importamos todos los handlers y filtros necesarios de telegram.ext
-from telegram.ext import ContextTypes, CallbackQueryHandler, CommandHandler, MessageHandler, filters
+# --- Importaciones de Aiogram Filters (Corregidas para v3.x) ---
+from aiogram.filters import CommandStart, Command # Corregido a importación correcta en v3.x
+# --- Fin Importaciones Aiogram Filters ---
+
 import logging
-import random # Necesario para el sorteo
-from datetime import datetime, timedelta # Importar datetime y timedelta
+import hashlib # Para generar comentario único
+from datetime import datetime # Para timestamp en comentario único
 
-# Importar funciones de base de datos que se usan directamente en handlers
-from .db import (
-    get_or_create_user, # Gestión de usuario básica
-    # count_paid_participants_in_round, # <-- Ya no necesitamos contar pagos aquí
-    # update_participant_paid_status # <-- Ya no necesitamos actualizar pago aquí, lo hace round_manager
+# --- Importaciones de tu proyecto (Corregidas a absolutas) ---
+# Asegúrate de que estas funciones existan en tu src/db.py fusionado y actualizado
+from src.db import ( # Corregido a importación absoluta
+    get_or_create_user,
+    get_active_round, # Para obtener la ronda lógica activa
+    # add_participant_to_round, # Si aún necesitas registrar participantes en la DB simulada
+    # count_participants_in_round, # Si aún necesitas contar participantes en la DB simulada
+    get_user_ton_payments_history, # Para /mis_pagos_ton
+    update_user_ton_wallet, # Para guardar la wallet TON del usuario
+    # add_ton_transaction # Ya se llama desde api.find_transaction
+    # get_round_by_id # Si lo necesitas directamente en handlers
 )
 
-# Importar las funciones y constantes de gestión de rondas desde round_manager.py
-from .round_manager import (
-    create_round,
-    get_round,
-    get_available_rounds,
-    add_participant, # <-- La lógica de pago está dentro de esta función ahora
-    count_round_participants,
-    update_round_status_manager,
-    get_round_participants_data, # Necesitamos esta para obtener la lista de participantes para mensajes
-    # Importamos constantes (ahora incluyendo las nuevas de límites de participantes)
-    MIN_PARTICIPANTS, # Límite máximo (10)
-    MIN_PARTICIPANTS_FOR_TIMED_DRAW, # Mínimo para sorteo por tiempo (2)
-    MAX_PARTICIPANTS_FOR_IMMEDIATE_DRAW, # Máximo para sorteo inmediato (10)
-    # DRAW_NUMBERS_COUNT, # Ya no usamos esta constante directamente aquí, la lógica del sorteo en payment_manager determina cuántos números sortear (1) y cuántos ganadores hay
-    ROUND_STATUS_WAITING_TO_START,
-    ROUND_STATUS_WAITING_FOR_PAYMENTS, # Este estado cambia su significado/uso
-    ROUND_STATUS_DRAWING,
-    ROUND_STATUS_FINISHED,
-    ROUND_STATUS_CANCELLED,
-    ROUND_TYPE_SCHEDULED,
-    ROUND_TYPE_USER_CREATED
-)
+# Importamos el módulo api para interactuar con TON Center y verificar transacciones
+from src import ton_api # Corregido a importación absoluta
 
+# Importamos PaymentManager si aún tiene lógica necesaria (ej. generar comentario, validar dirección)
+# Si PaymentManager solo envolvía la verificación de pago, esa lógica se mueve aquí.
+# Si PaymentManager tiene lógica compleja de precios, etc., lo mantenemos.
+# Asumiremos que PaymentManager ahora tiene métodos como get_standardized_wallet_address
+# y quizás lógica para generar comentarios únicos o detalles de pago.
+from src.payment_manager import PaymentManager # Corregido a importación absoluta
 
-# Importar funciones de gestión de pagos desde payment_manager.py
-from .payment_manager import (
-    # handle_simulated_payment_confirmation, # <-- ELIMINADA: Ya no necesitamos importar este handler de confirmación aquí
-    perform_payout_calculation_and_save, # Función para calcular y guardar premios/comisiones
-    # generate_simulated_smart_contract_address # No es necesario importarla aquí, se llama desde db.py
-)
-
-# Importar constantes de porcentaje de payment_manager para usarlas en reglas
-from .payment_manager import (
-    COMMISSION_PERCENT_GAS_SIMULATED,
-    COMMISSION_PERCENT_BOT,
-    COMMISSION_PERCENT_USER_CREATOR
-)
-BOT_USERNAME='TONLottoMasterBot'
+# from src.round_manager import RoundManager # Si tienes lógica compleja de rondas aquí
 
 logger = logging.getLogger(__name__)
 
-# --- Constantes de Juego (Las mínimas necesarias en handlers) ---
+# --- Definición de Estados FSM ---
+class BuyTicketStates(StatesGroup):
+    awaiting_user_wallet_input = State() # Nuevo estado para pedir la wallet del usuario
+    awaiting_payment_verification = State()
 
+# --- Funciones de Handlers ---
 
-# --- Handlers de Comandos ---
+async def cmd_start(message: types.Message, state: FSMContext):
+    """Maneja el comando /start."""
+    await state.finish()
+    # Tu función get_or_create_user ya maneja la conexión a DB
+    # Asegúrate de que get_or_create_user en db.py maneje username y first_name correctamente
+    src.db.get_or_create_user(str(message.from_user.id), message.from_user.username, message.from_user.first_name) # Llamada con prefijo
 
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Maneja el comando /start y deep links."""
-    user = update.effective_user # Obtiene el usuario que ejecutó el comando
-    user_id_str = str(user.id)
-    username = user.username or f"user_{user.id}" # Usa el username si existe, si no, un placeholder
-
-    # Registrar o obtener usuario en la DB
-    get_or_create_user(user_id_str, username) # Llama a la función de db.py
-
-    # --- Manejo de Deep Link para unirse a rondas ---
-    # Verifica si el comando /start vino con un argumento (payload de deep link)
-    if context.args and len(context.args) > 0:
-        deep_link_payload = context.args[0] # Obtiene el argumento (ej: 'join_round_21')
-        logger.info(f"Usuario {user_id_str} inició el bot con deep link payload: {deep_link_payload}")
-
-        # Si el payload indica que se quiere unir a una ronda
-        if deep_link_payload.startswith('join_round_'):
-            try:
-                # Extraer el ID de la ronda del payload (ej: 'join_round_21' -> '21')
-                round_id_str = deep_link_payload.split('join_round_')[1]
-                round_id = int(round_id_str) # Convertir el ID a entero
-                logger.info(f"Intentando unirse a ronda {round_id} vía deep link.")
-
-                # Llama a la lógica de unión de participante. El pago es automático al unirse.
-                # Pasa update y context para que process_join_logic pueda enviar mensajes.
-                await process_join_logic(update, context, round_id, user_id_str, username)
-
-
-                return # Termina el manejo del start command si se procesó un deep link válido
-
-            except ValueError:
-                logger.warning(f"Deep link payload 'join_round_' con ID no numérico: {deep_link_payload}")
-                await update.message.reply_html(f"⚠️ Enlace de ronda inválido: El ID debe ser un número.")
-                # Si el deep link es inválido, continuamos mostrando el mensaje de inicio normal
-
-        # Puedes añadir manejo para otros tipos de deep links aquí si los necesitas
-        # elif deep_link_payload == 'some_other_action':
-        #    ... procesar otro tipo de deep link ...
-
-
-    # Si no hay deep link válido o no se reconoció, muestra el mensaje de inicio normal
-
-
-    # --- Define la URL de tu Web App aquí ---
-    # Esta URL debe ser la dirección HTTPS pública donde has desplegado tu aplicación Flask.
-    # Durante el desarrollo, usa ngrok o similar. ¡Debe ser HTTPS!
-    web_app_url = "https://c649-2802-8011-210f-5a01-6917-2aa9-684b-a009.ngrok-free.app" # <-- ¡¡¡DEBES REEMPLAZAR ESTA CADENA CON LA URL REAL!!!
-    # Asegúrate de que esta URL sea accesible desde Internet y use HTTPS.
-
-
-    # Define los botones para el Reply Keyboard (menú principal)
-    keyboard = [
-        [KeyboardButton("🏆 Rondas Abiertas"), KeyboardButton("➕ Crear Ronda")], # Primera fila
-        [
-            KeyboardButton("📚 Reglas del Juego"), # Segunda fila
-            KeyboardButton("🎮 Abrir Interfaz Gráfica", web_app=WebAppInfo(url=web_app_url)) # <-- BOTÓN DE LA WEB APP
-        ] # Segunda fila
-    ]
-    # Crea el ReplyKeyboardMarkup con los botones definidos
-    # resize_keyboard=True: hace que el teclado sea más pequeño en la interfaz de Telegram
-    # one_time_keyboard=False: hace que el teclado permanezca visible después de usar un botón
-    reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=False)
-
-
-    # Envía el mensaje de bienvenida con el Reply Keyboard adjunto
-    await update.message.reply_html(
-        f"👋 ¡Hola, {user.mention_html()}! 👋\n\n" # Emoji y mención HTML del usuario
-        "🤖 Soy el bot del TON Ten Challenge.\n" # Emoji
-        "¡Usa los botones de abajo o escribe los comandos (/list_rounds, /create_round, /rules_mvp) para interactuar! ✨\n\n" # Emoji
-        "También puedes usar el botón '🎮 Abrir Interfaz Gráfica' para una experiencia visual más completa en la Web App." # Menciona el botón de la Web App
-        ,
-        reply_markup=reply_markup # Adjuntar el Reply Keyboard al mensaje
-    )
-    logger.info(f"Usuario {user_id_str} ({username}) inició el bot con Reply Keyboard y opción de Web App.")
-
-
-async def rules_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Maneja el comando /rules_mvp."""
-    rules_text = (
-        f"📚 <b>Reglas Generales (Simulación):</b>\n\n"
-        f"1️⃣ Entrada por ronda: <b>1 Unidad</b> (simulado). La entrada se 'paga' automáticamente al unirse a una ronda abierta.\n"
-        f"2️⃣ Una ronda cierra y sortea si se cumplen las condiciones:\n"
-        f"   - Si llega a <b>{MAX_PARTICIPANTS_FOR_IMMEDIATE_DRAW}</b> participantes: Sorteo Inmediato.\n"
-        f"   - Si tiene entre <b>{MIN_PARTICIPANTS_FOR_TIMED_DRAW} y {MAX_PARTICIPANTS_FOR_IMMEDIATE_DRAW-1}</b> participantes y pasan <b>30 minutos</b> desde su creación: Sorteo por Tiempo.\n"
-        f"   - Si tiene menos de <b>{MIN_PARTICIPANTS_FOR_TIMED_DRAW}</b> participantes y pasa <b>1 hora</b>: Ronda Cancelada.\n"
-        f"3️⃣ Los números asignados van del 1 al N, donde N es el número total de participantes que se unieron (y pagaron).\n"
-        f"4️⃣ Se sortea **1** número ganador entre los números asignados a los participantes que pagaron.\n\n"
-
-        f"➡️ Usa el botón '🏆 Rondas Abiertas' o /list_rounds para ver rondas abiertas y unirte directamente.\n"
-        f"➡️ Usa el botón '➕ Crear Ronda' o /create_round para crear tu ronda personal.\n\n"
-
-        f"⏱️ El sorteo inicia automáticamente cuando se cumplen las condiciones de cierre (10 participantes o tiempo/participantes).\n\n"
-    )
-    # Distribución de Ganancias (Simulación - Porcentajes)
-    rules_text += (
-        f"\n💰 <b>Distribución de Ganancias (Simulación - Basado en Porcentajes del Total Recaudado):</b>\n\n"
-
-        f"➡️ Comisiones Fijas (del Total Recaudado):\n"
-        # --- CORREGIDO: Usar nombres de constantes directamente ---
-        f"   - Fondo para Gas Simulado: <b>{int(COMMISSION_PERCENT_GAS_SIMULATED*100)}%</b>\n"
-        f"   - Comisión Bot (Tú): <b>{int(COMMISSION_PERCENT_BOT*100)}%</b>\n"
-        f"   - Comisión Creador (solo Ronda Usuario): <b>{int(COMMISSION_PERCENT_USER_CREATOR*100)}%</b>\n\n"
-
-        f"➡️ Pozo para Premios (restante): <b>{int(100 - COMMISSION_PERCENT_GAS_SIMULATED*100 - COMMISSION_PERCENT_BOT*100)}%</b> (Ronda Bot) o <b>{int(100 - COMMISSION_PERCENT_GAS_SIMULATED*100 - COMMISSION_PERCENT_BOT*100 - COMMISSION_PERCENT_USER_CREATOR*100)}%</b> (Ronda Usuario)\n\n"
-
-        f"➡️ Distribución del Pozo de Premios entre Ganadores:\n"
-        f"   - El único ganador del número sorteado recibe el <b>100%</b> del Pozo para Premios restante.\n\n"
-
-        f"<i>(¡Esto es una simulación, no se usan TON reales!)</i>"
+    keyboard = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=1)
+    keyboard.add(types.KeyboardButton("🎟️ Comprar Boleto (/comprar_boleto)"))
+    keyboard.add(types.KeyboardButton("📜 Mis Pagos TON (/mis_pagos_ton)")) # Texto del botón actualizado
+    
+    await message.answer(
+        f"¡Bienvenido al Bot de Lotería TON, {message.from_user.first_name}!\n\n"
+        "Usa los botones o comandos para interactuar.",
+        reply_markup=keyboard
     )
 
-    await update.message.reply_html(rules_text)
+async def cmd_buy_ticket_start(message: types.Message, state: FSMContext, pm_instance: PaymentManager):
+    """Inicia el proceso de compra de un boleto."""
+    await state.finish() # Asegurarse de que no hay estados previos activos
+
+    # --- 1. Obtener información de la ronda lógica activa (si usas rondas lógicas) ---
+    # Si tu lotería es continua o no usa rondas lógicas específicas, puedes omitir esto
+    active_round_data = src.db.get_active_round() # Llamada con prefijo (Asume que esta función retorna un dict o None)
+    
+    if not active_round_data:
+        await message.answer("Lo siento, no hay ninguna ronda de lotería activa en este momento. Intenta más tarde.")
+        return
+        
+    # Asume que active_round_data es un diccionario con claves como 'id', 'ticket_price_simulated', etc.
+    # Si get_active_round retorna una tupla, ajusta el acceso por índice (ej. active_round_data[0])
+    active_round_id = active_round_data.get('id', 'N/A') # Usamos .get para seguridad
+    ticket_price_ton = active_round_data.get('ticket_price_simulated', 1.0) # Obtener precio de la ronda o usar default
+
+    ticket_price_nano = int(ticket_price_ton * (10**9))
+    
+    # --- 2. Generar Comentario Único para la Transacción ---
+    # Este comentario asocia el pago a este usuario y esta ronda lógica
+    # Puedes usar un hash o una combinación de datos para asegurar unicidad
+    user_id_str = str(message.from_user.id)
+    timestamp_nano = int(datetime.now().timestamp()) # Timestamp en segundos (entero)
+    # Ejemplo simple de comentario único: L<round_id>U<user_id>T<timestamp>
+    payment_comment_text = f"L{active_round_id}U{user_id_str}T{timestamp_nano}"
+    # Asegúrate de que este formato de comentario sea compatible con el tamaño máximo permitido por TON (aprox 100 bytes)
+
+    # --- 3. Obtener Dirección de la Wallet de Recepción del Bot ---
+    bot_wallet_address = api.WALLET # Obtenido de config.json a través de api.py
+
+    # --- 4. Guardar detalles del pago esperado en FSM ---
+    await state.update_data(
+        payment_comment=payment_comment_text,
+        amount_nano=ticket_price_nano,
+        bot_wallet_to_pay=bot_wallet_address,
+        lottery_round_id=str(active_round_id), # Guardar como string para consistencia
+        ticket_price_ton_display=ticket_price_ton,
+        user_telegram_id=user_id_str # Guardar Telegram ID para usarlo en la verificación
+    )
+
+    # --- 5. Pedir la wallet TON al usuario (la que usará para pagar) ---
+    # Esto es necesario para que find_transaction pueda buscar transacciones desde esa wallet.
+    await message.answer(
+        f"Vas a comprar un boleto para la ronda <b>{active_round_id}</b> por <b>{ticket_price_ton} TON</b>.\n\n"
+        "Por favor, envía ahora la <b>dirección de tu wallet TON</b> (la que usarás para hacer el pago)."
+        "Esta dirección se guardará para futuras compras y para el envío de premios si ganas.",
+        parse_mode=types.ParseMode.HTML
+    )
+    # Cambiar al estado de espera de la wallet del usuario
+    await BuyTicketStates.awaiting_user_wallet_input.set()
 
 
-async def list_rounds_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Maneja el comando /list_rounds y muestra botones para unirse."""
-    user = update.effective_user
-    open_rounds = get_available_rounds()
+async def process_user_wallet_input(message: types.Message, state: FSMContext, pm_instance: PaymentManager):
+    """Procesa la dirección de wallet TON enviada por el usuario."""
+    user_wallet_raw = message.text.strip()
+    user_id_str = str(message.from_user.id)
+    
+    # Validar y estandarizar la dirección de la wallet del usuario
+    user_wallet_standardized = pm_instance.get_standardized_wallet_address(user_wallet_raw)
 
-    if not open_rounds:
-        await update.message.reply_text("❌ Actualmente no hay rondas abiertas a las que unirse. Usa el botón '➕ Crear Ronda' o /create_round para iniciar una.")
-        logger.info(f"Usuario {user.id} solicitó lista de rondas abiertas. No hay rondas.")
+    if not user_wallet_standardized:
+        await message.answer(
+            "La dirección de wallet que enviaste no parece válida o no pudimos procesarla.\n"
+            "Asegúrate de que sea una dirección de wallet TON correcta.\n"
+            "Intenta enviarla de nuevo, o escribe /cancelar."
+        )
+        return 
+
+    # Guardar la wallet estandarizada del usuario en FSM y en la DB (asociada a su Telegram ID)
+    await state.update_data(user_sending_wallet=user_wallet_standardized)
+    # Asegurar que el usuario existe y actualizar/registrar su wallet TON en la DB
+    src.db.get_or_create_user(user_id_str, message.from_user.username, message.from_user.first_name) # Llamada con prefijo
+    src.db.update_user_ton_wallet(user_id_str, user_wallet_standardized) # Llamada con prefijo
+
+
+    # Recuperar otros datos del pago esperado desde FSM
+    user_fsm_data = await state.get_data() 
+    bot_wallet_address = user_fsm_data['bot_wallet_to_pay']
+    amount_to_pay_nano = user_fsm_data['amount_nano']
+    payment_comment_text = user_fsm_data['payment_comment']
+    ticket_price_display = user_fsm_data['ticket_price_ton_display']
+
+    # --- 6. Presentar Instrucciones de Pago y Botones Deep Link ---
+    keyboard_payment_links = types.InlineKeyboardMarkup(row_width=1)
+    # Asegúrate de usar la URL correcta para Testnet/Mainnet si es diferente para las wallets
+    # api.WORK_MODE puede usarse para determinar si es testnet o mainnet
+    
+    # Construir URLs de deep link
+    # Es buena práctica URL encode el comentario si contiene caracteres especiales, aunque para este formato simple no es crítico.
+    # from urllib.parse import quote_plus
+    # encoded_comment = quote_plus(payment_comment_text)
+    
+    tonkeeper_url = f"https://app.tonkeeper.com/transfer/{bot_wallet_address}?amount={amount_to_pay_nano}&text={payment_comment_text}"
+    # Tonhub Testnet URL: test.tonhub.com, Mainnet URL: tonhub.com
+    tonhub_url = f"https://{'test.' if api.WORK_MODE == 'testnet' else ''}tonhub.com/transfer/{bot_wallet_address}?amount={amount_to_pay_nano}&text={payment_comment_text}"
+    # URL genérica ton://
+    generic_ton_url = f"ton://transfer/{bot_wallet_address}?amount={amount_to_pay_nano}&text={payment_comment_text}"
+
+    keyboard_payment_links.add(types.InlineKeyboardButton(text="🔷 Pagar con Tonkeeper", url=tonkeeper_url))
+    keyboard_payment_links.add(types.InlineKeyboardButton(text="💎 Pagar con Tonhub", url=tonhub_url))
+    keyboard_payment_links.add(types.InlineKeyboardButton(text="🚀 Pagar con otra wallet TON", url=generic_ton_url))
+
+    # Botón para que el usuario confirme que ha pagado
+    keyboard_confirm_action = types.InlineKeyboardMarkup(row_width=1)
+    # Incluimos el comentario único en el callback_data para identificar la verificación
+    keyboard_confirm_action.add(types.InlineKeyboardButton(text="✅ He realizado el pago", callback_data=f"verify_payment_{payment_comment_text}"))
+    keyboard_confirm_action.add(types.InlineKeyboardButton(text="❌ Cancelar compra", callback_data="payment_cancel"))
+
+
+    await message.answer(
+        f"Gracias. Ahora, por favor, realiza el pago de <code>{ticket_price_display}</code> TON a la siguiente dirección del bot:\n"
+        f"<code>{bot_wallet_address}</code>\n\n"
+        f"<b>MUY IMPORTANTE:</b> Debes incluir el siguiente texto EXACTO como comentario/mensaje en tu transacción:\n"
+        f"<code>{payment_comment_text}</code>\n\n"
+        f"Realizarás el pago desde tu wallet:\n<code>{user_wallet_standardized}</code>\n\n"
+        "Puedes usar los botones de abajo para abrir tu wallet con los datos precargados:",
+        reply_markup=keyboard_payment_links,
+        parse_mode=types.ParseMode.HTML
+    )
+    await message.answer(
+        "Una vez que hayas completado la transacción en tu wallet, presiona el botón '✅ He realizado el pago'.",
+        reply_markup=keyboard_confirm_action
+    )
+    
+    # --- 7. Cambiar a Estado de Espera de Verificación ---
+    await BuyTicketStates.awaiting_payment_verification.set()
+
+
+# --- Handler para el botón "He realizado el pago" ---
+# Escucha callbacks que empiezan con "verify_payment_"
+# Corregida la anotación de tipo para bot_instance
+async def callback_verify_payment(callback_query: types.CallbackQuery, state: FSMContext, pm_instance: PaymentManager, bot_instance: Bot):
+    """Maneja el callback cuando el usuario confirma que ha pagado y solicita verificación."""
+    # Extraer el comentario único del callback_data
+    # El callback_data es "verify_payment_<comentario_unico>"
+    callback_data_parts = callback_query.data.split('_', 2) # Divide en 3 partes: 'verify', 'payment', '<comentario_unico>'
+    if len(callback_data_parts) != 3 or callback_data_parts[0] != 'verify' or callback_data_parts[1] != 'payment':
+         logger.error(f"Callback data inesperado para verificación de pago: {callback_query.data}")
+         await callback_query.answer("Error interno al procesar la solicitud.", show_alert=True)
+         return # Salir si el formato del callback_data es incorrecto
+
+    unique_comment_from_callback = callback_data_parts[2]
+
+    # Responder inmediatamente al callback para quitar el reloj de carga
+    await callback_query.answer("Verificando tu pago, esto puede tardar unos segundos...", show_alert=False)
+    
+    user_id_str = str(callback_query.from_user.id)
+    user_fsm_data = await state.get_data()
+    
+    # Validar que los datos FSM necesarios estén presentes
+    required_fsm_keys = ['user_sending_wallet', 'amount_nano', 'bot_wallet_to_pay', 'lottery_round_id']
+    if not all(key in user_fsm_data for key in required_fsm_keys):
+        logger.error(f"Faltan datos FSM para verificar pago para user {user_id_str}. Datos: {user_fsm_data}")
+        await bot_instance.send_message(callback_query.message.chat.id, "Error interno: Faltan datos para verificar el pago. Por favor, intenta /comprar_boleto de nuevo.")
+        await state.finish()
         return
 
-    message_text = "🏆 <b>Rondas Abiertas:</b>\n\n"
-    inline_keyboard_buttons = []
+    user_sending_wallet = user_fsm_data['user_sending_wallet']
+    expected_amount_nano = user_fsm_data['amount_nano']
+    # expected_bot_wallet = user_fsm_data['bot_wallet_to_pay'] # No necesario pasarlo a find_transaction
+    lottery_round_id_assoc = user_fsm_data['lottery_round_id'] # ID de la ronda lógica
 
-    for ronda in open_rounds:
-        if len(ronda) >= 5:
-            ronda_id, start_time_str, status, round_type, simulated_contract_address = ronda
-            participants_count = count_round_participants(ronda_id) # Total de participantes unidos
+    # --- Llamar a la función de verificación de pago ---
+    # api.find_transaction ya llama a db.check_transaction y db.add_ton_transaction
+    # y asocia el Telegram ID si se le pasa.
+    is_verified = api.find_transaction(
+        user_wallet=user_sending_wallet, # La wallet desde donde el usuario pagó (estandarizada)
+        value_nano=str(expected_amount_nano), # Monto esperado en nanoTONs (como string para la API)
+        comment=unique_comment_from_callback, # El comentario único que esperamos
+        telegram_id=user_id_str # Pasamos el Telegram ID para la asociación en DB
+    )
 
-            try:
-                start_time = datetime.fromisoformat(start_time_str)
-                time_elapsed = datetime.now() - start_time
-                minutes, seconds = divmod(time_elapsed.total_seconds(), 60)
-                hours, minutes = divmod(minutes, 60)
-                time_elapsed_str = ""
-                if hours > 0:
-                     time_elapsed_str += f"{int(hours)}h "
-                time_elapsed_str += f"{int(minutes)}m"
-                time_elapsed_str = f" ({time_elapsed_str} ago)" if time_elapsed.total_seconds() > 0 else ""
-            except ValueError:
-                time_elapsed_str = " (Error tiempo)"
-                logger.warning(f"Error al calcular tiempo transcurrido para ronda {ronda_id}, start_time: {start_time_str}")
-            except Exception as e:
-                 time_elapsed_str = " (Error tiempo)"
-                 logger.error(f"Error inesperado al calcular tiempo transcurrido para ronda {ronda_id}: {e}")
+    # --- Procesar el resultado de la verificación ---
+    if is_verified:
+        # Si la verificación fue exitosa, el pago ya está registrado en ton_transactions.
+        # Ahora, si tu lógica de sorteo off-chain necesita registrar participantes
+        # en una tabla separada (ej. round_participants) o asociar el pago a una ronda lógica
+        # de manera más formal, hazlo aquí.
+        
+        # Ejemplo (si mantienes la tabla round_participants para la lógica de sorteo):
+        # try:
+        #     # Asignar número de participante y registrar en tabla round_participants
+        #     current_participants_count = src.db.count_participants_in_round(int(lottery_round_id_assoc)) # Necesitas esta función
+        #     assigned_number = current_participants_count + 1 # Lógica simple de asignación
+        #
+        #     src.db.add_participant_to_round( # Necesitas esta función en db.py
+        #         round_id=int(lottery_round_id_assoc),
+        #         telegram_id=user_id_str,
+        #         assigned_number=assigned_number # O el número que corresponda
+        #     )
+        #     # Notificar al usuario con el número asignado (si aplica)
+        #     await bot_instance.edit_message_text(...) # Mensaje con número asignado
+        #
+        # except Exception as e:
+        #     logger.error(f"Error al registrar participante en ronda simulada {lottery_round_id_assoc} para user {user_id_str}: {e}")
+        #     # Notificar al usuario sobre el problema en el registro del boleto
+        #     await bot_instance.send_message(...)
 
-
-            message_text += (
-                f"--- Ronda ID: <code>{ronda_id}</code> ---\n"
-                f" Tipo: {round_type.replace('_', ' ').title()}\n"
-                f" Estado: {status.replace('_', ' ').title()}\n"
-                f" Participantes: {participants_count}/10\n" # Mostrar vs el límite de 10
-                f" Iniciada: {datetime.fromisoformat(start_time_str).strftime('%Y-%m-%d %H:%M')}{time_elapsed_str}\n"
-                f" Contrato Sim.: <code>{simulated_contract_address}</code>\n"
+        # Mensaje de éxito general si solo registras en ton_transactions
+        await bot_instance.edit_message_text(
+            chat_id=callback_query.message.chat.id,
+            message_id=callback_query.message.message_id,
+            text=f"¡Pago confirmado! 🎉\nTu pago de <code>{expected_amount_nano / (10**9)}</code> TON para la ronda <b>{lottery_round_id_assoc}</b> ha sido verificado y registrado.\n"
+                     f"¡Mucha suerte, {callback_query.from_user.first_name}!\n\n"
+                     "Puedes ver tus pagos verificados con /mis_pagos_ton o iniciar otra compra con /comprar_boleto.",
+            parse_mode=types.ParseMode.HTML,
+            reply_markup=None # Eliminar botones inline
+        )
+        
+        await state.finish() # Finalizar el estado FSM
+    else:
+        # Si find_transaction retornó False
+        keyboard_retry_cancel = types.InlineKeyboardMarkup(row_width=1)
+        # El callback_data para reintentar debe incluir el comentario único original
+        keyboard_retry_cancel.add(types.InlineKeyboardButton(text="🔄 Reintentar Verificación", callback_data=f"verify_payment_{unique_comment_from_callback}"))
+        keyboard_retry_cancel.add(types.InlineKeyboardButton(text="❌ Cancelar Compra", callback_data="payment_cancel"))
+        
+        # Intentar editar el mensaje anterior si es posible, si no, enviar uno nuevo
+        try:
+            await bot_instance.edit_message_text( 
+                chat_id=callback_query.message.chat.id,
+                message_id=callback_query.message.message_id,
+                text="No pudimos confirmar tu pago en este momento.\n"
+                     "Asegúrate de que:\n"
+                     "1. La transacción ya se haya confirmado en la red TON (puede tardar un poco).\n"
+                     "2. Hayas enviado el monto exacto.\n"
+                     "3. Hayas incluido el comentario correcto.\n"
+                     "4. Hayas pagado desde la wallet que nos indicaste.\n\n"
+                     "Puedes esperar unos segundos y reintentar la verificación o cancelar la compra.",
+                reply_markup=keyboard_retry_cancel,
+                parse_mode=types.ParseMode.HTML
+            )
+        except Exception:
+            # Si falla la edición (ej. mensaje muy viejo), enviar un nuevo mensaje
+            await bot_instance.send_message( 
+                chat_id=callback_query.message.chat.id,
+                text="No pudimos confirmar tu pago en este momento.\n"
+                     "Asegúrate de que:\n"
+                     "1. La transacción ya se haya confirmado en la red TON (puede tardar un poco).\n"
+                     "2. Hayas enviado el monto exacto.\n"
+                     "3. Hayas incluido el comentario correcto.\n"
+                     "4. Hayas pagado desde la wallet que nos indicaste.\n\n"
+                     "Puedes esperar unos segundos y reintentar la verificación o cancelar la compra.",
+                reply_markup=keyboard_retry_cancel,
+                parse_mode=types.ParseMode.HTML
             )
 
-            # Crear botón "Unirse"
-            callback_data = f"join_{ronda_id}"
-            button = InlineKeyboardButton(f"➡️ Unirse a esta Ronda ({ronda_id})", callback_data=callback_data)
-            inline_keyboard_buttons.append([button])
 
-        else:
-             logger.error(f"get_available_rounds devolvió tupla inesperada para ronda: {ronda}")
-             message_text += f"⚠️ Error al mostrar detalles de ronda (ID {ronda[0] if len(ronda)>0 else '?'}).\n---\n"
+async def callback_payment_cancel(callback_query: types.CallbackQuery, state: FSMContext, bot_instance: Bot): # Corregida la anotación de tipo
+    """Maneja la cancelación del proceso de pago."""
+    await callback_query.answer("Compra cancelada.", show_alert=False)
+    current_state = await state.get_state()
+    if current_state is not None:
+        await state.finish()
+    
+    # Intentar editar el mensaje anterior si es posible, si no, enviar uno nuevo
+    try:
+        await bot_instance.edit_message_text(
+            chat_id=callback_query.message.chat.id,
+            message_id=callback_query.message.message_id,
+            text="La compra del boleto ha sido cancelada.",
+            parse_mode=types.ParseMode.HTML,
+            reply_markup=None # Eliminar botones inline
+        )
+    except Exception: 
+        await bot_instance.send_message(callback_query.message.chat.id, "La compra del boleto ha sido cancelada.")
+    
+    # Opcional: Enviar un mensaje final para guiar al usuario
+    # await bot_instance.send_message(callback_query.message.chat.id, "Puedes iniciar una nueva compra con /comprar_boleto o usar /start.")
 
-    message_text += "\n👆 Usa los botones de 'Unirse' arriba para participar directamente."
 
-    reply_markup = InlineKeyboardMarkup(inline_keyboard_buttons)
-
-    await update.message.reply_html(
-        message_text,
-        reply_markup=reply_markup
-    )
-    logger.info(f"Usuario {user.id} solicitó lista de rondas abiertas. Mostrando {len(open_rounds)} rondas con botones de unión.")
-
-
-async def create_round_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Maneja el comando /create_round."""
-    user = update.effective_user
-    user_id_str = str(user.id)
-    username = user.username or f"user_{user.id}"
-
-    get_or_create_user(user_id_str, username)
-
-    round_id = create_round(round_type=ROUND_TYPE_USER_CREATED, creator_telegram_id=user_id_str)
-
-    if round_id is None:
-        await update.message.reply_text("❌ Ocurrió un error al crear tu ronda personal. Intenta de nuevo más tarde.")
-        logger.error(f"Falló la creación de ronda de usuario para {user_id_str}.")
+async def cmd_cancel(message: types.Message, state: FSMContext):
+    """Maneja el comando /cancelar para salir de cualquier estado FSM."""
+    current_state = await state.get_state()
+    if current_state is None or current_state == 'BuyTicketStates:firstState': # Si ya está en un estado inicial o sin estado
+        await message.answer("No hay ninguna acción activa para cancelar.")
         return
 
-    created_round_data = get_round(round_id)
-    simulated_contract_address = "Dirección no disponible"
-    if created_round_data and len(created_round_data) >= 8:
-         simulated_contract_address = created_round_data[7]
+    logger.info(f"Cancelando estado {current_state} para usuario {message.from_user.id}")
+    await state.finish()
+    await message.answer("Acción cancelada. Puedes usar /start o /comprar_boleto.")
 
-    # --- AÑADE ESTE LOG DE DEPURACIÓN AQUÍ ---
-    logger.debug(f"Valor de BOT_USERNAME al generar Deep Link: '{BOT_USERNAME}'") # <-- Nuevo log
+async def cmd_my_paid_tickets(message: types.Message):
+    """Muestra los boletos/pagos verificados del usuario."""
+    user_id_str = str(message.from_user.id)
+    
+    # Asegura que el usuario exista en la DB
+    src.db.get_or_create_user(user_id_str, message.from_user.username, message.from_user.first_name) # Llamada con prefijo
+    
+    # Obtiene el historial de pagos TON verificados desde la tabla ton_transactions
+    user_payments = src.db.get_user_ton_payments_history(user_id_str) # Llamada con prefijo
 
-    # --- Generar y enviar el Deep Link de la ronda creada ---
-    if BOT_USERNAME: # Verificar si el username del bot está configurado y no es None/vacío
-         # ... (código para construir el deep link y enviar el mensaje con el enlace) ...
-         # Asegúrate que aquí dentro se usa el logger.info correcto "Deep Link generado: ..."
-         deep_link_payload = f"join_round_{round_id}"
-         round_share_url = f"https://t.me/{BOT_USERNAME}?start={deep_link_payload}"
+    if not user_payments:
+        await message.answer("No hemos encontrado pagos verificados asociados a tu cuenta de Telegram.\n"
+                             "Asegúrate de haber completado alguna compra de boleto y que tu pago haya sido verificado por el bot.")
+        return
 
-         await update.message.reply_html(
-             f"✨ ¡Has creado una ronda personal! 🎉\n\n"
-             f"Su ID es <code>{round_id}</code>.\n"
-             f"La dirección simulada del Smart Contract es: <code>{simulated_contract_address}</code>\n\n"
-             f"Comparte este enlace con tus amigos para que se unan directamente:\n" # Texto actualizado
-             f"🔗 <a href='{round_share_url}'>Unirse a Ronda {round_id}</a>\n\n" # El enlace real como un Deep Link HTML
-             f"La ronda sorteará al llegar a <b>{MAX_PARTICIPANTS_FOR_IMMEDIATE_DRAW}</b> participantes o si tiene entre <b>{MIN_PARTICIPANTS_FOR_TIMED_DRAW} y {MAX_PARTICIPANTS_FOR_IMMEDIATE_DRAW-1}</b> participantes y pasan <b>30 minutos</b>. ¡Invita a tus amigos! 👍" # Explica la lógica de cierre
-         )
-         logger.info(f"Usuario {user_id_str} ({username}) creó ronda personal con ID {round_id}, Dir Sim: {simulated_contract_address}. Deep Link generado: {round_share_url}")
-
-
-    else: # Si BOT_USERNAME es None, una cadena vacía o evaluated como False
-         logger.warning("Username del bot (BOT_USERNAME) no configurado o es inválido. No se puede generar Deep Link para compartir.") # <-- Este log
-         await update.message.reply_html(
-             f"✨ ¡Has creado una ronda personal con ID <code>{round_id}</code>! 🎉\n\n"
-             f"La dirección simulada del Smart Contract es: <code>{simulated_contract_address}</code>\n\n"
-             f"<b>⚠️ No se pudo generar el enlace directo para compartir.</b> Asegúrate de que el username del bot esté configurado correctamente en el archivo .env.\n\n"
-             f"Pide a tus amigos que se unan usando el comando: <code>/join_round {round_id}</code>\n\n"
-             f"La ronda sorteará al llegar a <b>{MAX_PARTICIPANTS_FOR_IMMEDIATE_DRAW}</b> participantes o si tiene entre <b>{MIN_PARTICIPANTS_FOR_TIMED_DRAW} y {MAX_PARTICIPANTS_FOR_IMMEDIATE_DRAW-1}</b> participantes y pasan <b>30 minutos</b>. ¡Invita a tus amigos! 👍"
-         )
-
-
-# --- Refactorizamos la lógica de unión común en una función para reutilizarla ---
-# Esta función ahora procesa la unión, marca el pago automático y verifica si gatilla sorteo por 10 participantes.
-async def process_join_logic(update: Update, context: ContextTypes.DEFAULT_TYPE, round_id: int, user_id_str: str, username: str) -> None:
-    """
-    Contiene la lógica común para añadir un participante a una ronda,
-    marcar el pago automático al unirse y verificar si gatilla sorteo por 10 participantes.
-    Es llamada por join_round_command y handle_callback_query.
-    """
-    # Llama a la función en round_manager para añadir al participante.
-    # add_participant ahora marca el pago como real simulado automáticamente si la unión es exitosa.
-    # Retorna (éxito: bool, mensaje: str, assigned_number: int | None, current_participants_count: int)
-    success_join, message_reply, assigned_number, current_participants_count = add_participant(round_id, user_id_str, username) # Llama a round_manager
-
-
-    # --- Enviar mensaje de respuesta al usuario usando context.bot.send_message ---
-    # Este mensaje indica si se unió con éxito o si hubo un error (ronda llena, ya unido, etc.)
-    # El mensaje ya incluye confirmación de que el boleto está "comprado" si la unión fue exitosa.
-    try:
-        # Usamos context.bot.send_message con el chat_id del usuario
-        await context.bot.send_message(chat_id=user_id_str, text=message_reply, parse_mode='HTML')
-    except Exception as e:
-         logger.error(f"Error al enviar mensaje de respuesta (unión) a usuario {user_id_str}: {e}")
-
-
-    if not success_join:
-         logger.warning(f"Usuario {user_id_str} falló al unirse a ronda {round_id}. Mensaje: {message_reply}")
-         return # Salir si la unión falló
-
-
-    # Si la unión fue exitosa (y el pago marcado automáticamente), continuamos.
-
-    # --- Verificamos si la ronda AHORA alcanzó 10 participantes ---
-    # current_participants_count fue retornado por add_participant y ya está actualizado si la unión tuvo éxito.
-    if current_participants_count == MAX_PARTICIPANTS_FOR_IMMEDIATE_DRAW: # Verificar si el total de participantes unidos llega a 10
-        logger.info(f"Ronda {round_id} alcanzó 10 participantes. Estado cambia a '{ROUND_STATUS_WAITING_FOR_PAYMENTS}'.") # Cambiamos a waiting_for_payments temporalmente
-        update_round_status_manager(round_id, ROUND_STATUS_WAITING_FOR_PAYMENTS) # Llama a round_manager
-
-        # Obtenemos los datos completos de la ronda para el mensaje a todos.
-        target_round_data_full = get_round(round_id)
-        round_smart_contract_address_full_msg = "ERROR_AL_OBTENER_DIRECCION"
-        if target_round_data_full and len(target_round_data_full) >= 8:
-            round_smart_contract_address_full_msg = target_round_data_full[7]
-        else:
-           logger.error(f"Datos incompletos al obtener ronda {round_id} para enviar mensaje de ronda llena a todos.")
-
-        # Obtener todos los participantes en la ronda para notificarles
-        all_participants_data = get_round_participants_data(round_id) # Llama a round_manager
-
-        round_full_message = (
-             f"🎉 ¡La ronda ID <code>{round_id}</code> alcanzó 10 participantes! 🎉\n\n"
-             f"Los <b>10</b> participantes están listos.\n"
-             f"El sorteo simulado se gatillará en breve.\n\n" # Texto actualizado: sorteo gatillado
-             f"Contrato Sim.: <code>{round_smart_contract_address_full_msg}</code>" # Información del contrato
-        )
-        # Enviar el mensaje a cada participante en la ronda
-        for participant in all_participants_data:
+    response_text = "<b>Historial de tus pagos verificados (Transacciones TON):</b>\n\n"
+    for payment in user_payments:
+        value_ton = payment['value_nano'] / (10**9)
+        comment = payment['comment'] if payment['comment'] else "Sin comentario"
+        # Puedes intentar extraer información de la ronda lógica del comentario si usas un formato específico
+        round_info_display = comment # Por defecto muestra el comentario completo
+        if comment and isinstance(comment, str) and comment.startswith('L') and 'U' in comment:
              try:
-                 await context.bot.send_message(chat_id=participant[0], text=round_full_message, parse_mode='HTML')
-             except Exception as e:
-                  logger.error(f"Error al enviar mensaje de ronda llena (10 part.) a usuario {participant[0]}: {e}")
+                 parts = comment.split('U')
+                 round_id_part = parts[0][1:]
+                 user_id_part = parts[1].split('T')[0] if 'T' in parts[1] else parts[1]
+                 round_info_display = f"Ronda {round_id_part} (Usuario {user_id_part})"
+             except Exception:
+                 # Si falla el parseo, usar el comentario original
+                 pass
+
+        # Asegúrate de que 'user_ton_wallet' y 'transaction_hash' existan en el diccionario 'payment'
+        user_wallet_display = payment.get('user_ton_wallet', 'Desconocida')
+        tx_hash_display = payment.get('transaction_hash', 'Desconocido')
+        tx_time_display = payment.get('transaction_time', 'Fecha desconocida')[:10] # Mostrar solo la fecha
+
+
+        response_text += (f"🔹 Pago de <b>{value_ton:.2f} TON</b>\n"
+                          f"   Comentario: <code>{comment}</code>\n"
+                          f"   Desde Wallet: <code>{user_wallet_display}</code>\n"
+                          f"   Hash TX: <code>{tx_hash_display[:10]}...</code>\n" 
+                          f"   Fecha Verificación: {tx_time_display}\n" 
+                          f"\n")
+    
+    await message.answer(response_text, parse_mode=types.ParseMode.HTML)
+
+
+def register_all_handlers(dp: Dispatcher, bot_instance: Bot, pm_instance: PaymentManager): # Corregida la anotación de tipo
+    """Registra todos los handlers en el dispatcher principal."""
+    
+    # db_instance no se pasa a los handlers individuales porque las funciones de db.py
+    # que se llaman directamente ya gestionan su propia conexión.
+
+    # Handlers de comandos y texto
+    dp.register_message_handler(
+        cmd_start, # No necesita pm_instance
+        CommandStart(), state="*")
+    
+    dp.register_message_handler(
+        lambda msg, state: cmd_buy_ticket_start(msg, state, pm_instance),
+        Command("comprar_boleto"), state="*")
+    dp.register_message_handler(
+        lambda msg, state: cmd_buy_ticket_start(msg, state, pm_instance),
+        text="🎟️ Comprar Boleto (/comprar_boleto)", state="*")
+        
+    # Handler para procesar la wallet del usuario
+    dp.register_message_handler(
+        lambda msg, state: process_user_wallet_input(msg, state, pm_instance),
+        state=BuyTicketStates.awaiting_user_wallet_input)
+        
+    # Handler para el comando /cancelar
+    dp.register_message_handler(cmd_cancel, Command("cancelar"), state="*")
+    
+    # Handler para el comando y botón de Mis Pagos TON
+    dp.register_message_handler(cmd_my_paid_tickets, Command("mis_pagos_ton"), state="*")
+    dp.register_message_handler(cmd_my_paid_tickets, text="📜 Mis Pagos TON (/mis_pagos_ton)", state="*")
+
+
+    # Handlers de Callbacks (botones inline)
+    # Handler para el botón "He realizado el pago" - Escucha callbacks que empiezan con "verify_payment_"
+    dp.register_callback_query_handler(
+        lambda cb_query, state: callback_verify_payment(cb_query, state, pm_instance, bot_instance),
+        lambda c: c.data and c.data.startswith('verify_payment_'), state=BuyTicketStates.awaiting_payment_verification) # Asegurarse de que c.data no es None
+        
+    # Handler para el botón "Cancelar compra"
+    dp.register_callback_query_handler(
+        lambda cb_query, state: callback_payment_cancel(cb_query, state, bot_instance),
+        lambda c: c.data == 'payment_cancel', state='*') # Puede cancelar desde cualquier estado
+
+
+    logger.info("Handlers de src.handlers (versión Aiogram) registrados.")
 
-        logger.info(f"Ronda {round_id} alcanzó 10 participantes. Mensaje de ronda llena enviado.")
-
-        # --- Gatillar sorteo inmediato si llega a 10 participantes ---
-        # Como todos están pagados al unirse, podemos pasar al estado de sorteo y gatillarlo.
-        # Cambiar estado a drawing inmediatamente después de waiting_for_payments simulado.
-        logger.info(f"Gatillando cambio de estado a '{ROUND_STATUS_DRAWING}' y sorteo inmediato para ronda {round_id}.")
-        update_round_status_manager(round_id, ROUND_STATUS_DRAWING) # Llama a round_manager
-        # Llamar a la función que coordina el sorteo. Pasa update y context.
-        await perform_simulated_draw_and_payout(update, context, round_id)
-
-
-    # Nota: La lógica de gatillar sorteo por tiempo (30min, 2-9 part.) se maneja en el Job de check_expired_rounds.
-
-
-async def join_round_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Maneja el comando /join_round. Llama a la lógica común de unión."""
-    user = update.effective_user
-    user_id_str = str(user.id)
-    username = user.username or f"user_{user.id}"
-    get_or_create_user(user_id_str, username)
-
-    round_id_to_join = None
-
-    if context.args:
-        try:
-            round_id_to_join = int(context.args[0])
-            logger.info(f"Usuario {user_id_str} intentó unirse a ronda con ID (via command arg): {round_id_to_join}")
-
-        except ValueError:
-            await update.message.reply_html("⚠️ Uso incorrecto. Para unirte a una ronda específica, usa <code>/join_round [ID_de_ronda]</code>. Usa el botón '🏆 Rondas Abiertas' o /list_rounds para ver las IDs.")
-            logger.warning(f"Usuario {user_id_str} usó /join_round con argumento no numérico: {context.args[0]}")
-            return
-
-    else:
-        logger.info(f"Usuario {user_id_str} usó /join_round sin argumento. Buscando ronda programada abierta.")
-        open_rounds = get_available_rounds()
-        scheduled_rounds = [r for r in open_rounds if r[3] == ROUND_TYPE_SCHEDULED]
-
-        if not scheduled_rounds:
-             await update.message.reply_text("❌ No hay rondas 'programadas' abiertas a las que unirse. Usa el botón '🏆 Rondas Abiertas' para ver todas las rondas abiertas o '➕ Crear Ronda' para crear la tuya.")
-             logger.info(f"Usuario {user_id_str} usó /join_round sin ID y no encontró ronda programada abierta.")
-             return
-
-        if len(scheduled_rounds[0]) >= 5:
-             round_id_to_join = scheduled_rounds[0][0]
-             logger.info(f"Usuario {user_id_str} usó /join_round sin ID. Seleccionando ronda programada {round_id_to_join}.")
-
-        else:
-             logger.error(f"get_available_rounds devolvió tupla incompleta para ronda programada: {scheduled_rounds[0]}")
-             await update.message.reply_text("❌ Ocurrió un error interno al obtener los detalles de la ronda programada. Intenta de nuevo más tarde.")
-             return
-
-    # Llama a la lógica de unión común. El pago es automático al unirse.
-    # Pasa update y context.
-    await process_join_logic(update, context, round_id_to_join, user_id_str, username)
-
-
-# --- ELIMINAMOS EL HANDLER confirm_payment_command ---
-# Este handler ya no es necesario para la confirmación de pago inicial.
-# Puedes borrar completamente la función confirm_payment_command.
-# Si decides darle un nuevo propósito (ej: verificar estado de pago), deberías re-implementarla.
-# Por ahora, la eliminamos para reflejar el flujo simplificado.
-
-# async def confirm_payment_command(...) -> None:
-#     """Maneja el comando /confirm_payment (AHORA OBSOLETO para confirmación inicial)."""
-#     pass # Eliminar contenido o toda la función
-
-
-# --- Handler para manejar las pulsaciones de botones en línea (Callback Queries) ---
-async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    Maneja las pulsaciones de botones en línea.
-    Procesa el callback_data para realizar acciones como unirse a una ronda.
-    """
-    query = update.callback_query # Obtiene el objeto CallbackQuery
-
-    await query.answer() # Responde a la callback query para quitar el estado de carga del botón.
-
-    user = query.from_user # Obtiene la información del usuario que pulsó el botón
-    user_id_str = str(user.id)
-    username = user.username or f"user_{user.id}"
-
-    data = query.data # Obtiene el callback_data (ej: 'join_21')
-
-    logger.info(f"Callback query recibida de usuario {user_id_str} ({username}): {data}")
-
-    # --- Procesar el dato de la callback query ---
-    if data.startswith('join_'):
-        try:
-            round_id = int(data.split('_')[1]) # Extraer el ID de la ronda
-
-            # Llama a la lógica de unión común (definida arriba). El pago es automático al unirse.
-            # Pasa update y context desde la callback query.
-            await process_join_logic(update, context, round_id, user_id_str, username)
-
-
-        except ValueError:
-            logger.warning(f"Callback data 'join_' con ID no numérico: {data} de usuario {user_id_str}.")
-            # Enviamos mensaje de error al usuario que pulsó el botón
-            try:
-                # Usamos context.bot.send_message con el chat_id del usuario
-                await context.bot.send_message(chat_id=user.id, text="⚠️ Error al procesar la solicitud. ID de ronda inválido.", parse_mode='HTML')
-            except Exception as e:
-                 logger.error(f"Error al enviar mensaje de error de valor a usuario {user.id}: {e}")
-        except Exception as e:
-            logger.error(f"Error inesperado en handle_callback_query (join) para usuario {user_id_str}: {e}")
-            # Enviamos mensaje de error al usuario que pulsó el botón
-            try:
-                # Usamos context.bot.send_message con el chat_id del usuario
-                await context.bot.send_message(chat_id=user.id, text="❌ Ocurrió un error inesperado al procesar tu solicitud. Intenta de nuevo más tarde.", parse_mode='HTML')
-            except Exception as e:
-                 logger.error(f"Error al enviar mensaje de error inesperado a usuario {user.id}: {e}")
-
-
-    # ... (Puedes añadir más 'elif' para manejar otros tipos de botones en línea) ...
-
-
-# --- Handler para el Texto de los Botones del Reply Keyboard ---
-# Este handler es responsable de procesar el texto enviado por los botones del ReplyKeyboardMarkup.
-async def handle_reply_button_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Maneja los mensajes de texto que coinciden con los botones del Reply Keyboard."""
-    text = update.message.text
-    user = update.effective_user
-
-    logger.info(f"Usuario {user.id} ({user.username}) envió texto: '{text}' (posible botón de Reply Keyboard)")
-
-    # Compara el texto del mensaje con el texto de tus botones del Reply Keyboard
-    # Si coincide, llama al handler de comando correspondiente.
-    if text == "🏆 Rondas Abiertas":
-        logger.info(f"Texto '{text}' coincide con '🏆 Rondas Abiertas'. Llamando a list_rounds_command.")
-        await list_rounds_command(update, context)
-
-    elif text == "➕ Crear Ronda":
-        logger.info(f"Texto '{text}' coincide con '➕ Crear Ronda'. Llamando a create_round_command.")
-        await create_round_command(update, context)
-
-    elif text == "📚 Reglas del Juego":
-        logger.info(f"Texto '{text}' coincide con '📚 Reglas del Juego'. Llamando a rules_command.")
-        await rules_command(update, context)
-
-    # Nota: El botón "🎮 Abrir Interfaz Gráfica" con WebAppInfo NO envía su texto
-    # como mensaje normal al bot. Telegram abre la Web App directamente.
-    # Por lo tanto, ese botón no necesita ser manejado aquí.
-
-
-# --- Función que coordina el Sorteo y el Cálculo/Guardado de Pagos ---
-# Esta función es llamada por process_join_logic (si se alcanzan 10 part.)
-# y por el job check_expired_rounds (cuando se cumple el tiempo para 2-9 part.).
-# Está en handlers.py porque necesita enviar mensajes a los usuarios, lo cual requiere update/context.
-async def perform_simulated_draw_and_payout(update: Update | None, context: ContextTypes.DEFAULT_TYPE, round_id: int) -> None:
-    """
-    Coordina la ejecución del sorteo simulado y llama a la lógica de cálculo y guardado de pagos en payment_manager.
-    Envía mensajes de resultados y comisiones a todos los participantes.
-    Finalmente, marca la ronda como finalizada. Puede ser llamada desde un handler (con update) o un job (sin update).
-    """
-    logger.info(f"Coordinando sorteo y pago simulado para ronda {round_id}. Llamada desde {'handler' if update else 'job'}.")
-
-
-    # Obtener la ronda para verificar su estado y tipo.
-    target_round = get_round(round_id) # Llama a round_manager
-
-    # Verificar que el estado sea 'drawing' antes de proceder.
-    if not target_round or len(target_round) < 8 or target_round[3] != ROUND_STATUS_DRAWING: # target_round[3] es el estado
-         logger.warning(f"Intento de sortear ronda {round_id} con estado inesperado o datos incompletos: {target_round}. Cancelando sorteo.")
-         error_msg = f"❌ Error interno: No se cumplen las condiciones para sortear la ronda ID <code>{round_id}</code>. La ronda no está en estado de sorteo o hay un problema de datos."
-
-         # Enviar el mensaje de error a todos los participantes si es posible
-         participants_data_if_available = get_round_participants_data(round_id) # Llama a round_manager
-         if participants_data_if_available:
-             for participant in participants_data_if_available:
-                 try:
-                     await context.bot.send_message(chat_id=participant[0], text=error_msg, parse_mode='HTML')
-                 except Exception as e:
-                     logger.error(f"Error al enviar mensaje de error de sorteo a usuario {participant[0]}: {e}")
-         # Si la llamada vino de un handler y hay un usuario efectivo, también se lo enviamos
-         elif update and update.effective_user: # Solo si update es válido y hay un usuario efectivo
-             try:
-                 await update.message.reply_html(error_msg)
-             except Exception as e:
-                  logger.error(f"Error al enviar mensaje de error de sorteo al usuario efectivo {update.effective_user.id}: {e}")
-         else:
-              logger.error(f"No se pudieron enviar mensajes de error de sorteo para ronda {round_id}.")
-
-
-         update_round_status_manager(round_id, ROUND_STATUS_CANCELLED) # Llama a round_manager
-         return
-
-
-    # Desempaquetar datos de la ronda para pasarlos a la lógica de cálculo de pago/comisión
-    ronda_id_actual = target_round[0] # ID de la ronda
-    round_type = target_round[4] # Tipo de ronda ('scheduled' o 'user_created')
-    creator_id = target_round[5]
-
-
-    # Obtener la lista de TODOS los participantes en la ronda de la DB.
-    # Ya que todos se consideran pagados al unirse, esta es la lista relevante para el sorteo y cálculo.
-    all_participants_data = get_round_participants_data(ronda_id_actual) # Llama a round_manager
-
-    # En la nueva lógica, el sorteo se gatilla si hay entre 2 y 10 participantes unidos (y pagados automáticamente).
-    current_participants_count = len(all_participants_data)
-    if current_participants_count < MIN_PARTICIPANTS_FOR_TIMED_DRAW: # Mínimo 2 para sorteo
-         logger.error(f"Intento de sorteo en ronda {ronda_id_actual} con menos de {MIN_PARTICIPANTS_FOR_TIMED_DRAW} participantes ({current_participants_count}). Cancelando sorteo.")
-         error_msg = f"❌ Error interno: La ronda ID <code>{ronda_id_actual}</code> no tiene suficientes participantes unidos para realizar el sorteo. Cancelando."
-         # Enviar mensaje de error a los participantes si es posible
-         if all_participants_data: # Usar la lista de todos los participantes
-             for participant in all_participants_data:
-                 try:
-                     await context.bot.send_message(chat_id=participant[0], text=error_msg, parse_mode='HTML')
-                 except Exception as e:
-                     logger.error(f"Error al enviar mensaje de error de sorteo a usuario {participant[0]}: {e}")
-         elif update and update.effective_user:
-              try:
-                  await update.message.reply_html(error_msg)
-              except Exception as e:
-                   logger.error(f"Error al enviar mensaje de error de sorteo al usuario efectivo {update.effective_user.id}: {e}")
-         else:
-              logger.error(f"No se pudieron enviar mensajes de error de sorteo para ronda {ronda_id_actual}.")
-
-         update_round_status_manager(ronda_id_actual, ROUND_STATUS_CANCELLED)
-         return
-
-
-    # --- Ejecutar el Sorteo ---
-    # Crear una lista de números asignados a TODOS los participantes unidos.
-    available_numbers = [p[2] for p in all_participants_data] # p[2] es el assigned_number
-
-    # En la nueva lógica, siempre sorteamos 1 número.
-    numbers_to_draw = 1
-
-    if len(available_numbers) < numbers_to_draw:
-         logger.error(f"No hay suficientes números asignados ({len(available_numbers)}) para sortear {numbers_to_draw} en ronda {ronda_id_actual}. Cancelando sorteo.")
-         error_msg = f"❌ Error interno: No hay suficientes números asignados para realizar el sorteo en la ronda ID <code>{ronda_id_actual}</code>. Cancelando."
-         # Enviar mensaje de error a los participantes si es posible
-         if all_participants_data:
-             for participant in all_participants_data:
-                 try:
-                      await context.bot.send_message(chat_id=participant[0], text=error_msg, parse_mode='HTML')
-                 except Exception as e:
-                     logger.error(f"Error al enviar mensaje de error de sorteo a usuario {participant[0]}: {e}")
-         elif update and update.effective_user:
-              try:
-                  await update.message.reply_html(error_msg)
-              except Exception as e:
-                   logger.error(f"Error al enviar mensaje de error de sorteo al usuario efectivo {update.effective_user.id}: {e}")
-         else:
-              logger.error(f"No se pudieron enviar mensajes de error de sorteo para ronda {ronda_id_actual}.")
-
-         update_round_status_manager(ronda_id_actual, ROUND_STATUS_CANCELLED)
-         return
-
-
-    # Realizar sorteo del número ganador entre los números de los participantes UNIDOS.
-    drawn_numbers = random.sample(available_numbers, numbers_to_draw) # numbers_to_draw = 1
-    drawn_winner_number = drawn_numbers[0] # El único número sorteado
-
-    logger.info(f"Número sorteado simulado para ronda {ronda_id_actual}: {drawn_winner_number} (sorteado entre {len(available_numbers)} unidos).")
-
-    # Enviar mensaje del número sorteado a todos los participantes si es posible
-    draw_result_message = f"🎉 ¡Número sorteado simulado para ronda ID <code>{ronda_id_actual}</code>! 🎉\nEl número ganador es: <b>{drawn_winner_number}</b>"
-    if all_participants_data:
-        for participant in all_participants_data:
-             try:
-                  await context.bot.send_message(chat_id=participant[0], text=draw_result_message, parse_mode='HTML')
-             except Exception as e:
-                  logger.error(f"Error al enviar mensaje de resultados de sorteo a usuario {participant[0]}: {e}")
-    elif update and update.effective_user:
-         try:
-              await update.message.reply_html(draw_result_message)
-         except Exception as e:
-              logger.error(f"Error al enviar mensaje de resultados de sorteo al usuario efectivo {update.effective_user.id}: {e}")
-    else:
-         logger.error(f"No se pudieron enviar mensajes de resultados de sorteo para ronda {ronda_id_actual}.")
-
-
-    # --- Calcular y Guardar Premios/Comisiones ---
-    # Llama a la función en payment_manager.
-    # Pasa el número sorteado y la lista de TODOS los participantes unidos para el cálculo.
-    winners_list_for_message, commissions_list_for_message = perform_payout_calculation_and_save(
-        ronda_id_actual, drawn_numbers, all_participants_data, round_type, creator_id # Pasa TODOS los datos de participantes unidos
-    )
-
-
-    # Anunciar ganadores en Telegram a todos los participantes si es posible
-    if winners_list_for_message:
-        winners_message = (
-            f"🏆 <b>¡Resultados del sorteo simulado para ronda ID <code>{ronda_id_actual}</code>!</b> 🏆\n\n"
-            "¡Este es el afortunado ganador simulado!\n"
-            + "\n".join(winners_list_for_message) +
-            "\n\n"
-        )
-        if all_participants_data: # Enviar a TODOS los participantes unidos
-            for participant in all_participants_data:
-                 try:
-                     await context.bot.send_message(chat_id=participant[0], text=winners_message, parse_mode='HTML')
-                 except Exception as e:
-                     logger.error(f"Error al enviar mensaje de ganadores a usuario {participant[0]}: {e}")
-        elif update and update.effective_user:
-             try:
-                  await update.message.reply_html(winners_message)
-             except Exception as e:
-                  logger.error(f"Error al enviar mensaje de ganadores al usuario efectivo {update.effective_user.id}: {e}")
-        else:
-             logger.error(f"No se pudieron enviar mensajes de ganadores para ronda {ronda_id_actual}.")
-
-        logger.info(f"Ganadores simulados anunciados para ronda {ronda_id_actual}.")
-    else:
-        no_winners_message = f"🥺 Nadie ganó en esta ronda simulada ID <code>{ronda_id_actual}</code>."
-        if all_participants_data:
-            for participant in all_participants_data:
-                 try:
-                      await context.bot.send_message(chat_id=participant[0], text=no_winners_message, parse_mode='HTML')
-                 except Exception as e:
-                      logger.error(f"Error al enviar mensaje de no ganadores a usuario {participant[0]}: {e}")
-        elif update and update.effective_user:
-             try:
-                  await update.message.reply_html(no_winners_message)
-             except Exception as e:
-                  logger.error(f"Error al enviar mensaje de no ganadores al usuario efectivo {update.effective_user.id}: {e}")
-        else:
-             logger.error(f"No se pudieron enviar mensajes de no ganadores para ronda {ronda_id_actual}.")
-
-
-    #Mensaje final de comisión y aviso de pago por Smart Contract (Usando la lista de mensajes de comisiones)
-    if commissions_list_for_message:
-         message_comissions_and_payout = (
-            f"💸 <b>Comisiones simuladas para ronda ID <code>{ronda_id_actual}</code>:</b>\n"
-            + "\n".join(commissions_list_for_message) +
-            f"\n\n✨ El Smart Contract de la ronda procesará la distribución de premios y comisiones (simulado)."
-         )
-         if all_participants_data:
-             for participant in all_participants_data:
-                  try:
-                       await context.bot.send_message(chat_id=participant[0], text=message_comissions_and_payout, parse_mode='HTML')
-                  except Exception as e:
-                       logger.error(f"Error al enviar mensaje de comisiones a usuario {participant[0]}: {e}")
-         elif update and update.effective_user:
-              try:
-                  await update.message.reply_html(message_comissions_and_payout)
-              except Exception as e:
-                   logger.error(f"Error al enviar mensaje de comisiones al usuario efectivo {update.effective_user.id}: {e}")
-         else:
-              logger.error(f"No se pudieron enviar mensajes de comisiones para ronda {ronda_id_actual}.")
-
-
-         logger.info(f"Mensajes de comisiones y pago por contrato enviados para ronda {ronda_id_actual}.")
-
-    else:
-        logger.warning(f"No se generaron mensajes de comisiones para ronda {ronda_id_actual}.")
-
-
-    #Marcar ronda como finalizada en la base de datos
-    update_round_status_manager(ronda_id_actual, ROUND_STATUS_FINISHED)
-    final_message = f"✅ Ronda de simulación ID <code>{ronda_id_actual}</code> finalizada y marcada como terminada."
-    if all_participants_data:
-        for participant in all_participants_data:
-             try:
-                  await context.bot.send_message(chat_id=participant[0], text=final_message, parse_mode='HTML')
-             except Exception as e:
-                 logger.error(f"Error al enviar mensaje de finalización a usuario {participant[0]}: {e}")
-    elif update and update.effective_user:
-         try:
-             await update.message.reply_html(final_message)
-         except Exception as e:
-              logger.error(f"Error al enviar mensaje de finalización al usuario efectivo {update.effective_user.id}: {e}")
-    else:
-         logger.error(f"No se pudieron enviar mensajes de finalización para ronda {ronda_id_actual}.")
-
-
-    logger.info(f"Ronda {ronda_id_actual} finalizada y estado actualizado a '{ROUND_STATUS_FINISHED}'.")
